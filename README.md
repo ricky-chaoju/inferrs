@@ -11,7 +11,6 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 | | inferrs | vLLM | llama.cpp |
 |---|---|---|---|
 | **Language** | Rust | Python/C++ | C/C++ |
-| **Memory strategy** | Grow on demand | Pre-allocates ~90% of GPU memory at startup | Fixed per-request allocation |
 | **Continuous batching** | ✓ | ✓ | ✗ |
 | **Streaming (SSE)** | ✓ | ✓ | ✓ |
 | **Chunked prefill** | ✓ | ✓ | ✗ |
