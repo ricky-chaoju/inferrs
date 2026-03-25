@@ -57,6 +57,7 @@ tokio-stream = "0.1"
 async-stream = "0.3"
 anyhow = "1"
 byteorder = "1"
+crossterm = "0.28"
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }
