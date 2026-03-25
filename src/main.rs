@@ -4,6 +4,8 @@ mod engine;
 mod hub;
 mod kv_cache;
 mod models;
+mod rm;
+mod run;
 mod sampler;
 mod scheduler;
 mod server;
@@ -24,8 +26,12 @@ struct Cli {
 enum Commands {
     /// Serve a model from HuggingFace Hub
     Serve(ServeArgs),
+    /// Run a model interactively (like ollama run)
+    Run(run::RunArgs),
     /// Benchmark inference throughput and latency
     Bench(bench::BenchArgs),
+    /// Remove a cached model from local disk
+    Rm(rm::RmArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -142,22 +148,35 @@ impl ServeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // For `run` and `rm`, suppress info-level logging by default — the interactive REPL
+    // writes to stdout and log lines would corrupt the prompt display.
+    // Users can still get logs by setting RUST_LOG explicitly (e.g. RUST_LOG=debug).
+    let default_log_level = match &cli.command {
+        Commands::Run(_) | Commands::Rm(_) => "error",
+        _ => "info",
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
         )
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Serve(args) => {
             tracing::info!("Starting inferrs server for model: {}", args.model);
             server::run(args).await?;
         }
+        Commands::Run(args) => {
+            run::run(args)?;
+        }
         Commands::Bench(args) => {
             tracing::info!("Running benchmark for model: {}", args.serve.model);
             bench::run(args)?;
+        }
+        Commands::Rm(args) => {
+            rm::run(args)?;
         }
     }
 

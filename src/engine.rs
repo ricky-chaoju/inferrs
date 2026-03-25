@@ -9,7 +9,7 @@ use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
 
-/// Request to the engine.
+/// Request to the engine (async/tokio version, used by the HTTP server).
 pub enum EngineRequest {
     /// Generate tokens for a chat completion.
     Generate {
@@ -24,6 +24,17 @@ pub enum EngineRequest {
         prompt_tokens: Vec<u32>,
         sampling_params: SamplingParams,
         token_tx: mpsc::Sender<StreamToken>,
+    },
+}
+
+/// Request to the engine using only stdlib channels (no Tokio, used by `inferrs run`).
+pub enum SyncEngineRequest {
+    /// Generate tokens with streaming, sending each token over a stdlib channel.
+    GenerateStream {
+        request_id: String,
+        prompt_tokens: Vec<u32>,
+        sampling_params: SamplingParams,
+        token_tx: std::sync::mpsc::SyncSender<StreamToken>,
     },
 }
 
@@ -147,6 +158,38 @@ impl Engine {
         }
 
         tracing::info!("Engine loop stopped");
+    }
+
+    /// Run the engine loop using only stdlib channels — no Tokio runtime required.
+    /// Used by `inferrs run` so that blocking sends/recvs work on a plain OS thread.
+    pub fn run_sync(mut self, rx: std::sync::mpsc::Receiver<SyncEngineRequest>) {
+        tracing::info!("Engine loop started (sync)");
+
+        for request in rx {
+            match request {
+                SyncEngineRequest::GenerateStream {
+                    request_id,
+                    prompt_tokens,
+                    sampling_params,
+                    token_tx,
+                } => {
+                    if let Err(e) = self.generate_stream_sync(
+                        &request_id,
+                        &prompt_tokens,
+                        &sampling_params,
+                        &token_tx,
+                    ) {
+                        let _ = token_tx.send(StreamToken {
+                            token_id: 0,
+                            text: format!("Error: {}", e),
+                            finish_reason: Some("error".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        tracing::info!("Engine loop stopped (sync)");
     }
 
     // ── Paged-attention helpers ───────────────────────────────────────────────
@@ -347,6 +390,103 @@ impl Engine {
 
             if token_tx
                 .blocking_send(StreamToken {
+                    token_id,
+                    text,
+                    finish_reason: finish_reason.clone(),
+                })
+                .is_err()
+                || finish_reason.is_some()
+            {
+                break;
+            }
+        }
+
+        if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+        }
+
+        Ok(())
+    }
+
+    /// Streaming generation using stdlib `SyncSender` — identical logic to
+    /// `generate_stream` but sends tokens via `std::sync::mpsc` instead of
+    /// `tokio::sync::mpsc`, so it can be called from a plain OS thread.
+    fn generate_stream_sync(
+        &mut self,
+        request_id: &str,
+        prompt_tokens: &[u32],
+        sampling_params: &SamplingParams,
+        token_tx: &std::sync::mpsc::SyncSender<StreamToken>,
+    ) -> Result<()> {
+        tracing::debug!(
+            "Streaming generation (sync) for request {} ({} prompt tokens)",
+            request_id,
+            prompt_tokens.len()
+        );
+
+        let mut output_tokens: Vec<u32> = Vec::new();
+        let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
+
+        // Prefill
+        let logits = if let Some(ps) = &mut self.paged {
+            ps.block_table.free_all(&mut ps.block_pool);
+            self.model.clear_kv_cache();
+            Self::paged_prefill(&mut self.model, &self.device, prompt_tokens, ps)?
+        } else {
+            self.model.clear_kv_cache();
+            let input_ids = Tensor::new(prompt_tokens, &self.device)?.unsqueeze(0)?;
+            self.model.forward(&input_ids, 0)?
+        };
+
+        let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+        output_tokens.push(token_id);
+        all_tokens.push(token_id);
+
+        let text = self.tokenizer.decode(&[token_id], true)?;
+        let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+
+        if token_tx
+            .send(StreamToken {
+                token_id,
+                text,
+                finish_reason: finish_reason.clone(),
+            })
+            .is_err()
+            || finish_reason.is_some()
+        {
+            if let Some(ps) = &mut self.paged {
+                ps.block_table.free_all(&mut ps.block_pool);
+            }
+            return Ok(());
+        }
+
+        // Decode loop
+        loop {
+            let last_token = *output_tokens.last().unwrap();
+            let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
+
+            let logits = if let Some(ps) = &mut self.paged {
+                Self::paged_decode_step(
+                    &mut self.model,
+                    &self.device,
+                    last_token,
+                    seqlen_offset,
+                    ps,
+                )?
+            } else {
+                let input_ids = Tensor::new(&[last_token], &self.device)?.unsqueeze(0)?;
+                self.model.forward(&input_ids, seqlen_offset)?
+            };
+
+            let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+            output_tokens.push(token_id);
+            all_tokens.push(token_id);
+
+            let text = self.tokenizer.decode(&[token_id], true)?;
+            let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+
+            if token_tx
+                .send(StreamToken {
                     token_id,
                     text,
                     finish_reason: finish_reason.clone(),
