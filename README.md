@@ -14,7 +14,7 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 | **Continuous batching** | ✓ | ✓ | ✗ |
 | **Streaming (SSE)** | ✓ | ✓ | ✓ |
 | **Chunked prefill** | ✓ | ✓ | ✗ |
-| **KV cache management** | Per-context concatenation/PagedAttention | PagedAttention | Per-context allocation |
+| **KV cache management** | Per-context allocation/PagedAttention | PagedAttention | Per-context allocation |
 | **Multi-GPU / distributed** | Single device | Multi-GPU, tensor parallel | Partial (model splitting) |
 | **Desktop friendly** | ✓ — lightweight | ✗ — claims most GPU memory | ✓ — lightweight |
 | **Binary footprint** | Single static binary | Python environment + deps | Single binary |
