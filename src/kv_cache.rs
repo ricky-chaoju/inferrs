@@ -273,25 +273,6 @@ impl PagedKvStore {
         })
     }
 
-    /// Write key/value vectors for one token into the store at `slot_id`.
-    ///
-    /// `k` / `v`: tensors of shape `[num_kv_heads, head_dim]`.
-    pub fn write_slot(
-        &mut self,
-        layer_idx: usize,
-        slot_id: usize,
-        k: &Tensor,
-        v: &Tensor,
-    ) -> candle_core::Result<()> {
-        // index_add on dim 0: add k at position slot_id
-        let idx = Tensor::new(&[slot_id as u32], k.device())?;
-        self.key_caches[layer_idx] =
-            self.key_caches[layer_idx].index_add(&idx, &k.unsqueeze(0)?, 0)?;
-        self.value_caches[layer_idx] =
-            self.value_caches[layer_idx].index_add(&idx, &v.unsqueeze(0)?, 0)?;
-        Ok(())
-    }
-
     /// Gather key and value tensors for all slots in `slot_ids`.
     ///
     /// Returns `(k, v)` each of shape `[seq_len, num_kv_heads, head_dim]`.

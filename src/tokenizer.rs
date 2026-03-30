@@ -232,7 +232,7 @@ fn detect_chat_template(config: &Option<TokenizerConfig>) -> ChatTemplate {
     ChatTemplate::ChatML
 }
 
-fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String {
+fn apply_chatml_inner(messages: &[ChatMessage], assistant_suffix: &str) -> String {
     let mut prompt = String::new();
     for msg in messages {
         prompt.push_str(&format!(
@@ -240,9 +240,13 @@ fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String
             msg.role, msg.content
         ));
     }
-    // Add the assistant turn marker
     prompt.push_str("<|im_start|>assistant\n");
+    prompt.push_str(assistant_suffix);
     prompt
+}
+
+fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String {
+    apply_chatml_inner(messages, "")
 }
 
 /// Qwen3.5 ChatML template with thinking disabled.
@@ -254,16 +258,7 @@ fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String
 /// the model enters thinking mode and prepends a long chain-of-thought before
 /// the actual reply.
 fn apply_qwen35(messages: &[ChatMessage]) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        prompt.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
-            msg.role, msg.content
-        ));
-    }
-    // Add the assistant turn marker with the no-think prefix
-    prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
-    prompt
+    apply_chatml_inner(messages, "<think>\n\n</think>\n\n")
 }
 
 fn apply_gemma(messages: &[ChatMessage], bos_token: &Option<String>) -> String {

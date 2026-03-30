@@ -12,7 +12,10 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
-use crate::models::attention_utils::{apply_rms_norm_heads, causal_mask, repeat_kv, PagedCtx};
+use crate::models::attention_utils::{
+    apply_rms_norm_heads, causal_mask, paged_write_gather_sdpa, precompute_rope, repeat_kv,
+    AttnDims, Mlp, PagedCtx,
+};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -53,44 +56,6 @@ pub struct Qwen35Config {
 // ---------------------------------------------------------------------------
 // RoPE utilities
 // ---------------------------------------------------------------------------
-
-/// Precompute (cos, sin) for positions 0..max_seq_len with partial rotation.
-fn precompute_rope(
-    head_dim: usize,
-    partial_factor: f64,
-    rope_theta: f64,
-    max_seq_len: usize,
-    dtype: DType,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let rot_dim = (head_dim as f64 * partial_factor) as usize;
-    // round down to even
-    let rot_dim = rot_dim & !1;
-    let half = rot_dim / 2;
-
-    // freqs: [half]
-    let freqs: Vec<f32> = (0..half)
-        .map(|i| {
-            let exp = 2.0 * i as f32 / rot_dim as f32;
-            1.0 / (rope_theta as f32).powf(exp)
-        })
-        .collect();
-    let freqs = Tensor::new(freqs.as_slice(), device)?;
-
-    // positions: [max_seq_len]
-    let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
-    let positions = Tensor::new(positions.as_slice(), device)?;
-
-    // outer product -> [max_seq_len, half]
-    let emb = positions
-        .unsqueeze(1)?
-        .broadcast_mul(&freqs.unsqueeze(0)?)?;
-
-    // cos/sin: [max_seq_len, half]
-    let cos = emb.cos()?.to_dtype(dtype)?;
-    let sin = emb.sin()?.to_dtype(dtype)?;
-    Ok((cos, sin))
-}
 
 /// Apply rotary embedding to query/key tensors.
 /// x: [batch, n_heads, seq_len, head_dim]
@@ -136,34 +101,8 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 }
 
 // ---------------------------------------------------------------------------
-// SwiGLU MLP
+// SwiGLU MLP (shared implementation in attention_utils::Mlp)
 // ---------------------------------------------------------------------------
-
-struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Mlp {
-    fn new(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?.silu()?;
-        let up = self.up_proj.forward(x)?;
-        let hidden = (gate * up)?;
-        self.down_proj.forward(&hidden).map_err(Into::into)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Full attention layer (GQA + QK-norm + RoPE, no bias)
@@ -364,68 +303,21 @@ impl FullAttention {
         let q = apply_rope(&q, &cos_slice, &sin_slice)?;
         let k = apply_rope(&k, &cos_slice, &sin_slice)?;
 
-        // ── Write new K/V into the paged store ───────────────────────────────
-        for ti in 0..t {
-            let position = seqlen_offset + ti;
-            let slot_id = ctx.block_table.slot_for(position).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "paged attention: no slot allocated for position {}",
-                    position
-                )
-            })?;
-            let k_tok = k.narrow(2, ti, 1)?.squeeze(2)?.squeeze(0)?;
-            let v_tok = v.narrow(2, ti, 1)?.squeeze(2)?.squeeze(0)?;
-            ctx.kv_store
-                .write_slot(ctx.layer_idx, slot_id as usize, &k_tok, &v_tok)?;
-        }
+        // ── Write/gather/SDPA ─────────────────────────────────────────────────
+        let out = paged_write_gather_sdpa(
+            &q,
+            &k,
+            &v,
+            &AttnDims {
+                num_heads: self.num_heads,
+                num_kv_heads: self.num_kv_heads,
+                head_dim: self.head_dim,
+                seqlen_offset,
+            },
+            ctx,
+        )?;
 
-        // ── Gather full K/V context for this sequence ─────────────────────────
-        let total_tokens = seqlen_offset + t;
-        let slot_ids: Vec<u32> = (0..total_tokens)
-            .map(|pos| {
-                ctx.block_table.slot_for(pos).ok_or_else(|| {
-                    anyhow::anyhow!("paged attention: missing slot for position {}", pos)
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let (k_full, v_full) = ctx.kv_store.gather_slots(ctx.layer_idx, &slot_ids)?;
-
-        // Reshape to [b, num_kv_heads, kv_len, head_dim]  (b == 1)
-        let kv_len = total_tokens;
-        let k_full = k_full
-            .reshape((b, kv_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v_full = v_full
-            .reshape((b, kv_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // ── GQA expand ───────────────────────────────────────────────────────
-        let groups = self.num_heads / self.num_kv_heads;
-        let k_full = repeat_kv(k_full, groups)?;
-        let v_full = repeat_kv(v_full, groups)?;
-
-        // ── Scaled dot-product attention ─────────────────────────────────────
-        let scale = (self.head_dim as f64).sqrt();
-        let attn = q
-            .contiguous()?
-            .matmul(&k_full.transpose(2, 3)?.contiguous()?)?
-            .affine(1.0 / scale, 0.0)?;
-
-        let attn = if t > 1 {
-            let mask = causal_mask(t, kv_len, seqlen_offset, attn.device(), attn.dtype())?;
-            attn.broadcast_add(&mask)?
-        } else {
-            attn
-        };
-
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-        let out = attn.matmul(&v_full.contiguous()?)?;
-
-        // ── Reshape + output gate ─────────────────────────────────────────────
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b, t, self.num_heads * self.head_dim))?;
+        // ── Output gate ───────────────────────────────────────────────────────
         let gate_sig = (gate.neg()?.exp()? + 1.0)?.recip()?;
         let out = out.broadcast_mul(&gate_sig)?;
 
@@ -813,7 +705,7 @@ impl DecoderLayer {
     fn new_full(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             attn: LayerAttn::Full(FullAttention::new(cfg, vb.pp("self_attn"))?),
-            mlp: Mlp::new(cfg, vb.pp("mlp"))?,
+            mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(
                 cfg.hidden_size,
@@ -826,7 +718,7 @@ impl DecoderLayer {
     fn new_linear(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             attn: LayerAttn::Linear(LinearAttn::new(cfg, vb.pp("linear_attn"))?),
-            mlp: Mlp::new(cfg, vb.pp("mlp"))?,
+            mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(
                 cfg.hidden_size,
