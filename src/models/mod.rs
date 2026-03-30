@@ -170,7 +170,7 @@ pub fn load_model(
         }
     }
 
-    match arch {
+    let model: Box<dyn CausalLM> = match arch {
         ModelArchitecture::Qwen3 => {
             let config = raw_config.to_qwen3_config(dtype, device.clone(), turbo_quant_bits);
             tracing::info!(
@@ -181,9 +181,9 @@ pub fn load_model(
                 config.num_key_value_heads,
                 config.head_dim,
             );
-            let model = qwen3::Qwen3Model::new(&config, vb)?;
-            tracing::info!("Model loaded successfully");
-            Ok(Box::new(Qwen3ModelWrapper { inner: model }))
+            Box::new(Qwen3ModelWrapper {
+                inner: qwen3::Qwen3Model::new(&config, vb)?,
+            })
         }
         ModelArchitecture::Qwen2 => {
             let config = raw_config.to_qwen2_config();
@@ -194,9 +194,9 @@ pub fn load_model(
                 config.hidden_size,
                 config.num_key_value_heads
             );
-            let model = candle_transformers::models::qwen2::ModelForCausalLM::new(&config, vb)?;
-            tracing::info!("Model loaded successfully");
-            Ok(Box::new(Qwen2Model { inner: model }))
+            Box::new(Qwen2Model {
+                inner: candle_transformers::models::qwen2::ModelForCausalLM::new(&config, vb)?,
+            })
         }
         ModelArchitecture::Gemma2 => {
             let config = raw_config.to_gemma2_config();
@@ -207,9 +207,9 @@ pub fn load_model(
                 config.hidden_size,
                 config.head_dim
             );
-            let model = candle_transformers::models::gemma2::Model::new(false, &config, vb)?;
-            tracing::info!("Model loaded successfully");
-            Ok(Box::new(Gemma2Model { inner: model }))
+            Box::new(Gemma2Model {
+                inner: candle_transformers::models::gemma2::Model::new(false, &config, vb)?,
+            })
         }
         ModelArchitecture::Gemma3 => {
             let config = raw_config.to_gemma3_config();
@@ -220,9 +220,9 @@ pub fn load_model(
                 config.hidden_size,
                 config.head_dim
             );
-            let model = candle_transformers::models::gemma3::Model::new(false, &config, vb)?;
-            tracing::info!("Model loaded successfully");
-            Ok(Box::new(Gemma3Model { inner: model }))
+            Box::new(Gemma3Model {
+                inner: candle_transformers::models::gemma3::Model::new(false, &config, vb)?,
+            })
         }
         ModelArchitecture::Qwen35 => {
             let config = raw_config.to_qwen35_config(dtype, device.clone());
@@ -233,9 +233,11 @@ pub fn load_model(
                 config.hidden_size,
                 config.num_key_value_heads,
             );
-            let model = qwen3_5::Qwen35Model::new(&config, vb)?;
-            tracing::info!("Model loaded successfully");
-            Ok(Box::new(Qwen35ModelWrapper { inner: model }))
+            Box::new(Qwen35ModelWrapper {
+                inner: qwen3_5::Qwen35Model::new(&config, vb)?,
+            })
         }
-    }
+    };
+    tracing::info!("Model loaded successfully");
+    Ok(model)
 }

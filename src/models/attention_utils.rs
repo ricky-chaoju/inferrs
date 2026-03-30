@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::RmsNorm;
+use candle_nn::{linear_no_bias, ops, Linear, RmsNorm, VarBuilder};
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 
@@ -73,4 +73,175 @@ pub fn causal_mask(
         .reshape((1, 1, q_len, kv_len))?
         .to_dtype(dtype)?;
     Ok(mask)
+}
+
+// ---------------------------------------------------------------------------
+// Shared SwiGLU MLP
+// ---------------------------------------------------------------------------
+
+/// SwiGLU MLP: down_proj( silu(gate_proj(x)) * up_proj(x) ).
+/// Used by both Qwen3 and Qwen3.5 (and any future architecture with the same
+/// MLP topology).
+pub struct Mlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl Mlp {
+    pub fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
+        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
+        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
+        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(x)?.silu()?;
+        let up = self.up_proj.forward(x)?;
+        let hidden = (gate * up)?;
+        self.down_proj.forward(&hidden).map_err(Into::into)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared RoPE precomputation
+// ---------------------------------------------------------------------------
+
+/// Precompute (cos, sin) tables for positions 0..max_seq_len.
+///
+/// `partial_factor` controls what fraction of `head_dim` is rotated:
+/// - Use `1.0` for full rotation (Qwen3).
+/// - Use a value like `0.25` for partial rotation (Qwen3.5).
+///
+/// The returned tensors have shape `[max_seq_len, rot_dim/2]`.
+pub fn precompute_rope(
+    head_dim: usize,
+    partial_factor: f64,
+    rope_theta: f64,
+    max_seq_len: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let rot_dim = ((head_dim as f64 * partial_factor) as usize) & !1; // round down to even
+    let half = rot_dim / 2;
+
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| {
+            let exp = 2.0 * i as f32 / rot_dim as f32;
+            1.0 / (rope_theta as f32).powf(exp)
+        })
+        .collect();
+    let freqs = Tensor::new(freqs.as_slice(), device)?;
+
+    let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
+    let positions = Tensor::new(positions.as_slice(), device)?;
+
+    // outer product -> [max_seq_len, half]
+    let emb = positions
+        .unsqueeze(1)?
+        .broadcast_mul(&freqs.unsqueeze(0)?)?;
+
+    let cos = emb.cos()?.to_dtype(dtype)?;
+    let sin = emb.sin()?.to_dtype(dtype)?;
+    Ok((cos, sin))
+}
+
+// ---------------------------------------------------------------------------
+// Shared paged write / gather / SDPA
+// ---------------------------------------------------------------------------
+
+/// Attention head dimensions passed to [`paged_write_gather_sdpa`].
+pub struct AttnDims {
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub seqlen_offset: usize,
+}
+
+/// Write new K/V tokens into the paged store, then gather the full K/V context
+/// and run scaled dot-product attention.
+///
+/// `q`      : query,  `[b, num_heads,    t, head_dim]`
+/// `k` / `v`: key/value, `[b, num_kv_heads, t, head_dim]`
+///
+/// Returns the attention output `[b, t, num_heads * head_dim]` (already
+/// transposed/reshaped, ready for the output projection).
+pub fn paged_write_gather_sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    dims: &AttnDims,
+    ctx: &mut PagedCtx,
+) -> Result<Tensor> {
+    let AttnDims {
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seqlen_offset,
+    } = *dims;
+    let (b, _nh, t, _hd) = q.dims4()?;
+
+    // Resolve slot IDs for the new tokens and for the full context in one pass.
+    let total_tokens = seqlen_offset + t;
+    let all_slot_ids: Vec<u32> = (0..total_tokens)
+        .map(|pos| {
+            ctx.block_table
+                .slot_for(pos)
+                .ok_or_else(|| anyhow::anyhow!("paged attention: no slot for position {}", pos))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Batch-write all new K/V tokens with a single index_add per tensor,
+    // reducing kernel launches from 2*t to 2.
+    // k/v: [b=1, num_kv_heads, t, head_dim] -> [t, num_kv_heads, head_dim]
+    let new_slot_ids = &all_slot_ids[seqlen_offset..];
+    let new_slots_tensor = Tensor::new(new_slot_ids, k.device())?;
+    let k_new = k.squeeze(0)?.transpose(0, 1)?.contiguous()?; // [t, num_kv_heads, head_dim]
+    let v_new = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+    ctx.kv_store.key_caches[ctx.layer_idx] =
+        ctx.kv_store.key_caches[ctx.layer_idx].index_add(&new_slots_tensor, &k_new, 0)?;
+    ctx.kv_store.value_caches[ctx.layer_idx] =
+        ctx.kv_store.value_caches[ctx.layer_idx].index_add(&new_slots_tensor, &v_new, 0)?;
+
+    let (k_full, v_full) = ctx.kv_store.gather_slots(ctx.layer_idx, &all_slot_ids)?;
+
+    let kv_len = total_tokens;
+    let k_full = k_full
+        .reshape((b, kv_len, num_kv_heads, head_dim))?
+        .transpose(1, 2)?;
+    let v_full = v_full
+        .reshape((b, kv_len, num_kv_heads, head_dim))?
+        .transpose(1, 2)?;
+
+    // GQA expand
+    let groups = num_heads / num_kv_heads;
+    let k_full = repeat_kv(k_full, groups)?;
+    let v_full = repeat_kv(v_full, groups)?;
+
+    // Scaled dot-product attention
+    let scale = (head_dim as f64).sqrt();
+    let attn = q
+        .contiguous()?
+        .matmul(&k_full.transpose(2, 3)?.contiguous()?)?
+        .affine(1.0 / scale, 0.0)?;
+
+    let attn = if t > 1 {
+        let mask = causal_mask(t, kv_len, seqlen_offset, attn.device(), attn.dtype())?;
+        attn.broadcast_add(&mask)?
+    } else {
+        attn
+    };
+
+    let attn = ops::softmax_last_dim(&attn)?;
+    let out = attn.matmul(&v_full.contiguous()?)?; // [b, num_heads, t, head_dim]
+
+    out.transpose(1, 2)?
+        .reshape((b, t, num_heads * head_dim))?
+        .contiguous()
+        .map_err(Into::into)
 }
