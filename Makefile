@@ -3,12 +3,15 @@
 # Packages that can be built/tested without GPU toolchains (CUDA, ROCm).
 NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan
 
-.PHONY: build all fmt clippy test
+.PHONY: all build release fmt clippy test
+
+all: fmt clippy test build
 
 build:
 	cargo build $(NO_GPU_PKGS)
 
-all: fmt clippy test build
+release:
+	cargo build --release $(NO_GPU_PKGS)
 
 fmt:
 	cargo fmt --check $(NO_GPU_PKGS)
