@@ -1,7 +1,7 @@
-//! Gemma 4 text-only language model implementation (gg-hf-gg variant).
+//! Gemma 4 text-only language model implementation (google variant).
 //!
 //! This implements the simplified Gemma 4 text model as represented in the
-//! `gg-hf-gg/gemma-4-E2B-it` checkpoint.  The full Gemma 3n model includes
+//! `google/gemma-4-E2B-it` checkpoint.  The full Gemma 3n model includes
 //! AltUp, Laurel, and KV-sharing components; this variant omits them and uses
 //! a straightforward transformer decoder with per-layer input residuals.
 //!

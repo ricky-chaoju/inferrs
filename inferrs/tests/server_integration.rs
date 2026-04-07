@@ -145,7 +145,7 @@ fn chat_completion(port: u16, user_message: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Verifies that `gg-hf-gg/gemma-4-E2B-it` returns a coherent (intelligible)
+/// Verifies that `google/gemma-4-E2B-it` returns a coherent (intelligible)
 /// response to a trivial chat message.
 ///
 /// The test is marked `#[ignore]` so that it is skipped by the default
@@ -158,7 +158,7 @@ fn chat_completion(port: u16, user_message: &str) -> String {
 #[test]
 #[ignore = "requires model download and significant compute; run with --ignored"]
 fn gemma4_e2b_returns_intelligible_output() {
-    let model_id = "gg-hf-gg/gemma-4-E2B-it";
+    let model_id = "google/gemma-4-E2B-it";
     let port = free_port();
 
     let mut server = spawn_server(model_id, port);
