@@ -412,6 +412,30 @@ impl TurboQuantKvCache {
         }
     }
 
+    /// Return `true` when the cache has no stored tokens (not yet populated).
+    pub fn is_empty(&self) -> bool {
+        self.seq_len == 0 && self.warmup_kv_buf_len == 0
+    }
+
+    /// Adopt an existing (k, v) pair as the warmup buffer without copying.
+    ///
+    /// Used for "TQ prefill bypass": after a non-TQ prefill that stored K/V in
+    /// a plain cache, call this to make TQ own those tensors directly as its
+    /// warmup buffer on the first decode step — no `contiguous()` + `slice_set`
+    /// copy required.
+    ///
+    /// `k` and `v` must have shape `[1, num_kv_heads, seq_len, head_dim]` and
+    /// be contiguous.  The tensors are adopted as-is; no allocation is performed.
+    pub fn adopt_warmup_buffer(&mut self, k: Tensor, v: Tensor) -> Result<()> {
+        let seq_len = k.dim(2)?;
+        // Set cap == seq_len so that dequantize() knows the buffer is exactly
+        // the right size and returns it directly (contiguous, no extra copy).
+        self.warmup_kv_buf = Some((k, v));
+        self.warmup_kv_buf_cap = seq_len;
+        self.warmup_kv_buf_len = seq_len;
+        Ok(())
+    }
+
     /// Compress a pair of on-device tensors `[1, num_kv_heads, t, head_dim]`
     /// into the packed quantized store.  Used both by `append` (decode path)
     /// and by the prefill-flush in `dequantize`.
@@ -608,14 +632,34 @@ impl TurboQuantKvCache {
     /// decode step.
     pub fn dequantize(&mut self) -> Result<(Tensor, Tensor)> {
         // Warmup path: KV data is stored unquantized in the pre-allocated buffer.
-        // Return a zero-copy narrow view — no allocation.
+        //
+        // The warmup buffer is allocated with capacity `warmup_kv_buf_cap` but
+        // contains only `warmup_kv_buf_len` valid tokens.  A `narrow` view along
+        // dim 2 produces a NON-CONTIGUOUS tensor (the stride for dim 1 still
+        // reflects the full buffer capacity, not the valid token count).
+        // Non-contiguous K/V causes cuBLAS matmul to force an implicit copy at
+        // each attention layer, which at 35 layers × 2 tensors × ~150-300KB is
+        // a significant overhead.
+        //
+        // Use `slice_set` into a fresh contiguous buffer when the buffer has
+        // excess capacity, and a direct return otherwise (if cap == len,
+        // narrow IS contiguous because stride[1] == len * head_dim == shape[2] * stride[2]).
         if self.warmup_kv_buf_len > 0 {
             let (kb, vb) = self
                 .warmup_kv_buf
                 .as_ref()
                 .expect("warmup_kv_buf must be set when warmup_kv_buf_len > 0");
-            let k = kb.narrow(2, 0, self.warmup_kv_buf_len)?;
-            let v = vb.narrow(2, 0, self.warmup_kv_buf_len)?;
+            let len = self.warmup_kv_buf_len;
+            let cap = self.warmup_kv_buf_cap;
+            if cap == len {
+                // Buffer exactly fits valid tokens — narrow is contiguous.
+                return Ok((kb.clone(), vb.clone()));
+            }
+            // Cap > len: narrow would be non-contiguous. Return a contiguous copy.
+            // This costs one GPU copy per dequantize call during prefill, but
+            // saves 35 implicit cuBLAS copies during the attention matmuls.
+            let k = kb.narrow(2, 0, len)?.contiguous()?;
+            let v = vb.narrow(2, 0, len)?.contiguous()?;
             return Ok((k, v));
         }
 
