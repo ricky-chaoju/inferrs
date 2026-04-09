@@ -495,25 +495,33 @@ impl TurboQuantKvCache {
         // Check whether we're in the warmup phase for this token.
         let total_buffered = self.warmup_kv_buf_len + self.seq_len;
         let needed = self.warmup_kv_buf_len + new_seq;
-        // Stay in warmup only if the resulting buffer would still fit within
-        // the warmup budget.  A prefill larger than `warmup_seq_len` must go
-        // directly to the quantized path; allowing it into the warmup path
-        // would cap the buffer at `warmup_seq_len` and cause a `slice_set`
-        // shape-mismatch panic (dst: 256, src: N + 0) for N > warmup_seq_len.
-        let in_warmup = self.warmup_seq_len > 0
-            && total_buffered < self.warmup_seq_len
-            && needed <= self.warmup_seq_len;
+        // Always keep prefill tokens (new_seq > 1) on-device unquantized,
+        // deferring compression to the first decode step.  This eliminates
+        // the per-layer GPU→CPU transfer + CPU quantization during prefill,
+        // which was the dominant source of TTFT overhead with TurboQuant.
+        //
+        // For decode (new_seq == 1), stay in the warmup buffer until the
+        // total buffered length reaches warmup_seq_len, then flush and
+        // compress all at once.
+        //
+        // The warmup buffer cap is grown dynamically in the in_warmup branch,
+        // so there is no longer a fixed ceiling of warmup_seq_len on
+        // what can be buffered unquantized.
+        let in_warmup = new_seq > 1
+            || (self.warmup_seq_len > 0
+                && total_buffered < self.warmup_seq_len
+                && needed <= self.warmup_seq_len);
 
         if in_warmup {
             // Warmup path (decode only once past prefill): write into the
             // pre-allocated warmup buffer via `slice_set`.  This avoids
             // `Tensor::cat` on every decode step (128+ allocations per request).
             if needed > self.warmup_kv_buf_cap {
-                // Grow the buffer by doubling, capped at the warmup threshold.
-                let new_cap = needed
-                    .next_power_of_two()
-                    .max(MIN_KV_BUFFER_CAP)
-                    .min(self.warmup_seq_len);
+                // Grow the buffer to hold at least `needed` tokens (round up
+                // to the next power of two for amortised growth).  There is no
+                // cap: prefill sequences larger than warmup_seq_len must still
+                // fit in the buffer.
+                let new_cap = needed.next_power_of_two().max(MIN_KV_BUFFER_CAP);
                 let mut k_shape = k.dims().to_vec();
                 k_shape[2] = new_cap;
                 let new_k_buf = Tensor::zeros(k_shape.as_slice(), k.dtype(), k.device())?;
