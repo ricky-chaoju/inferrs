@@ -105,12 +105,14 @@ pub fn download_model(
         return load_local_model(as_path);
     }
 
-    // ── OCI store lookup ────────────────────────────────────────────────
-    // Before hitting the network, check if the model is already available
-    // in the Docker Model Runner OCI store (~/.docker/models).  This
-    // allows `inferrs serve gemma3` to reuse models pulled by DMR (or
-    // by `inferrs pull`) without re-downloading.
+    // ── OCI model resolution ────────────────────────────────────────────
+    // For OCI references (single word → docker.io/ai, or explicit registry),
+    // first check the Docker Model Runner store (~/.docker/models) for a
+    // cached bundle.  If not found, auto-pull via the Go helper.
+    // This allows `inferrs run gemma3` and `inferrs serve docker.io/org/model`
+    // to work seamlessly — reusing DMR's cache or pulling on demand.
     if let crate::pull::RefKind::Oci = crate::pull::classify_reference(model_id) {
+        // 1. Already cached?
         if let Some(bundle_path) = crate::pull::oci_bundle(model_id) {
             tracing::info!(
                 "Found OCI model in local store: {} → {}",
@@ -119,6 +121,10 @@ pub fn download_model(
             );
             return load_local_model(&bundle_path);
         }
+        // 2. Not cached — pull it from the OCI registry.
+        tracing::info!("OCI model not cached, pulling: {}", model_id);
+        let bundle_path = crate::pull::oci_pull(model_id)?;
+        return load_local_model(&bundle_path);
     }
 
     tracing::info!("Downloading model {} (revision: {})", model_id, revision);
