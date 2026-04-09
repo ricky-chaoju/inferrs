@@ -14,9 +14,11 @@ pub struct ModelFiles {
     pub config_path: PathBuf,
     pub tokenizer_path: PathBuf,
     pub tokenizer_config_path: Option<PathBuf>,
-    /// Original safetensors shards (always present).
+    /// Original safetensors shards (may be empty when loading a pre-existing
+    /// GGUF from a CNCF ModelPack bundle).
     pub weight_paths: Vec<PathBuf>,
-    /// Path to the quantized GGUF file, populated when `--quantize` was given.
+    /// Path to a GGUF file.  Populated when `--quantize` was given or when
+    /// loading a CNCF ModelPack bundle that contains a GGUF model.
     /// When `Some`, callers should load weights from this GGUF instead of
     /// `weight_paths`.
     pub gguf_path: Option<PathBuf>,
@@ -25,6 +27,11 @@ pub struct ModelFiles {
 /// Load model files from a local directory (no network required).
 pub fn load_local_model(path: &std::path::Path) -> Result<ModelFiles> {
     tracing::info!("Loading model from local path: {}", path.display());
+
+    // ── CNCF ModelPack bundle detection ─────────────────────────────────
+    if crate::modelpack::is_modelpack_bundle(path) {
+        return crate::modelpack::load_bundle(path);
+    }
 
     let config_path = path.join("config.json");
     anyhow::ensure!(
@@ -402,6 +409,17 @@ pub fn download_and_maybe_quantize(
     if files.weight_paths.is_empty() {
         tracing::warn!(
             "--quantize is ignored for GGUF-only repos (the downloaded GGUF is used as-is)"
+        );
+        return Ok(files);
+    }
+
+    // When the model was loaded from a CNCF ModelPack bundle that already
+    // contains a pre-quantized GGUF, skip the quantization step — the
+    // weights are already in the desired format.
+    if files.gguf_path.is_some() {
+        tracing::info!(
+            "Model already has a GGUF file (e.g. from a ModelPack bundle); \
+             skipping --quantize"
         );
         return Ok(files);
     }
