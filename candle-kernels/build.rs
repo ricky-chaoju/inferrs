@@ -143,7 +143,29 @@ fn main() {
         }
     }
 
-    println!("cargo:rustc-link-lib=static=cudart_static");
+    // Modifier breakdown:
+    //
+    //   -bundle            : do NOT extract libcudart_static.a's objects into
+    //                        the candle_kernels rlib.  Bundling was silently
+    //                        failing on ubuntu-24.04-arm CI (the sbsa toolkit
+    //                        layout confused rustc's internal native-lib
+    //                        lookup, so the directive was dropped entirely
+    //                        and the downstream linker never saw
+    //                        -lcudart_static).  `-bundle` forces rustc to
+    //                        pass the `-l` through verbatim and let the
+    //                        final linker resolve it via the `-L` paths we
+    //                        emitted above.
+    //
+    //   +whole-archive     : wrap the linker inclusion in
+    //                        `-Wl,--whole-archive ... -Wl,--no-whole-archive`
+    //                        so every object in libcudart_static.a is pulled
+    //                        in regardless of ordering with libmoe.a.  Without
+    //                        this, a link-order quirk where cudart is seen
+    //                        before libmoe.a's references can cause the
+    //                        linker to skip cudart objects and then complain
+    //                        about undefined references when it gets to
+    //                        libmoe.a.
+    println!("cargo:rustc-link-lib=static:-bundle,+whole-archive=cudart_static");
     if !is_target_msvc {
         // cudart_static uses dlopen and POSIX realtime clocks internally.
         println!("cargo:rustc-link-lib=dylib=dl");
