@@ -69,7 +69,7 @@ inferrs serve --paged-attention google/gemma-4-E2B-it
 inferrs serve --quantize google/gemma-4-E2B-it
 ```
 
-#### Serve without a model (Ollama-compatible mode on port 17434)
+#### Serve models ollama-style
 
 ```bash
 inferrs serve
