@@ -22,6 +22,11 @@ pub struct PullArgs {
     #[arg(long, value_name = "FILENAME")]
     pub gguf_file: Option<String>,
 
+    /// Optional HuggingFace repository to download tokenizer.json and config.json from
+    /// (e.g. microsoft/Phi-4-reasoning-plus). Useful for GGUF-only repos that lack source metadata.
+    #[arg(long, value_name = "REPO")]
+    pub tokenizer_source: Option<String>,
+
     /// Quantize weights and cache the result as a GGUF file.
     ///
     /// Accepted formats (case-insensitive): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
@@ -44,6 +49,7 @@ pub fn run(args: PullArgs) -> Result<()> {
         &args.model,
         &args.revision,
         args.gguf_file.as_deref(),
+        args.tokenizer_source.as_deref(),
         quant_dtype,
     )?;
 

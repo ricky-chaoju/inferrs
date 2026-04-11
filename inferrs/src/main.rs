@@ -174,6 +174,11 @@ pub struct ServeArgs {
     #[arg(long, value_name = "FILENAME")]
     pub gguf_file: Option<String>,
 
+    /// Optional HuggingFace repository to download tokenizer.json and config.json from
+    /// (e.g. microsoft/Phi-4-reasoning-plus). Useful for GGUF-only repos that lack source metadata.
+    #[arg(long, value_name = "REPO")]
+    pub tokenizer_source: Option<String>,
+
     /// Quantize model weights and cache the result on disk as a GGUF file.
     /// On first use the weights are quantized and saved next to the HuggingFace cache;
     /// subsequent runs reuse the cached GGUF, so the slow conversion only happens once.

@@ -105,6 +105,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "FILENAME")]
     pub gguf_file: Option<String>,
 
+    /// Optional HuggingFace repository to download tokenizer.json and config.json from
+    /// (e.g. microsoft/Phi-4-reasoning-plus). Useful for GGUF-only repos that lack source metadata.
+    #[arg(long, value_name = "REPO")]
+    pub tokenizer_source: Option<String>,
+
     /// Quantize model weights on first use and cache as GGUF.
     /// Accepted formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K.
     /// Plain `--quantize` defaults to Q4K.
@@ -510,6 +515,9 @@ async fn warm_up_model(client: &Client, base_url: &str, args: &RunArgs) -> Resul
     }
     if let Some(ref f) = args.gguf_file {
         options.insert("gguf_file".into(), f.clone().into());
+    }
+    if let Some(ref ts) = args.tokenizer_source {
+        options.insert("tokenizer_source".into(), ts.clone().into());
     }
 
     let mut body = serde_json::json!({

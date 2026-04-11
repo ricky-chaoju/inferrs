@@ -623,6 +623,8 @@ pub struct OllamaOptions {
     pub quantize: Option<String>,
     /// Specific GGUF filename to load from a GGUF-only repo
     pub gguf_file: Option<String>,
+    /// Optional HuggingFace repository to download tokenizer.json and config.json from
+    pub tokenizer_source: Option<String>,
 
     // ── Extended sampling fields ──────────────────────────────────────────────
     pub seed: Option<i64>,
@@ -1208,6 +1210,9 @@ async fn spawn_worker(
         }
         if let Some(ref f) = o.gguf_file {
             args.extend(["--gguf-file".into(), f.clone()]);
+        }
+        if let Some(ref ts) = o.tokenizer_source {
+            args.extend(["--tokenizer-source".into(), ts.clone()]);
         }
     }
 

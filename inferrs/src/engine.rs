@@ -134,6 +134,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         model_id,
         &args.revision,
         args.gguf_file.as_deref(),
+        args.tokenizer_source.as_deref(),
         quant_dtype,
     )?;
 
