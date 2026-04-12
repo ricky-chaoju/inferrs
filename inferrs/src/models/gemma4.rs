@@ -709,11 +709,19 @@ enum MoeExpertWeights {
 }
 
 impl MoeExpertWeights {
-    /// Return the weight matrix for a single expert, converted to `dtype` on `device`.
-    fn expert_weight(&self, expert_idx: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    /// Return a `QLinear` for a single expert.
+    ///
+    /// On the GGUF path this wraps the per-expert `Arc<QTensor>` directly in a
+    /// `QMatMul::QTensor`, so `forward()` dispatches to the optimised Metal/CUDA
+    /// quantized GEMV kernel (Q8_0, Q4K, …) without materialising a full BF16 copy.
+    /// On the safetensors path it wraps the dense weight slice as `QMatMul::Tensor`.
+    fn expert_linear(&self, expert_idx: usize) -> Result<QLinear> {
         match self {
-            Self::Quantized(qtensors) => qtensors[expert_idx].dequantize(device)?.to_dtype(dtype),
-            Self::Dense(t) => t.narrow(0, expert_idx, 1)?.squeeze(0),
+            Self::Quantized(qtensors) => QLinear::from_qtensor(qtensors[expert_idx].clone(), None),
+            Self::Dense(t) => Ok(QLinear::from_tensor(
+                t.narrow(0, expert_idx, 1)?.squeeze(0)?,
+                None,
+            )),
         }
     }
 }
@@ -733,6 +741,13 @@ fn split_expert_qtensor(
     use std::borrow::Cow;
 
     let raw = qt.data()?;
+    if raw.len() % num_experts != 0 {
+        candle_core::bail!(
+            "split_expert_qtensor: raw byte count {} is not divisible by num_experts {}",
+            raw.len(),
+            num_experts
+        );
+    }
     let dtype_q = qt.dtype();
     let bytes_per_expert = raw.len() / num_experts;
 
@@ -887,8 +902,10 @@ impl Gemma4MoeExperts {
             let current = hidden.index_select(&idx_tensor, 0)?; // [n, hidden]
 
             // gate_up[expert_idx]: [2*intermediate, hidden]
-            let gate_up = self.gate_up_proj.expert_weight(expert_idx, dtype, device)?;
-            let gate_up_out = current.matmul(&gate_up.t()?)?; // [n, 2*intermediate]
+            // QLinear::apply dispatches to the Metal/CUDA quantized GEMV kernel
+            // (Q8_0, Q4K, …) without materialising a full BF16 copy.
+            let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
+            let gate_up_out = current.apply(&gate_up_linear)?; // [n, 2*intermediate]
 
             let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
             let up =
@@ -896,8 +913,8 @@ impl Gemma4MoeExperts {
             let hidden_act = (self.act_fn.forward(&gate)? * up)?;
 
             // down[expert_idx]: [hidden, intermediate]
-            let down = self.down_proj.expert_weight(expert_idx, dtype, device)?;
-            let expert_out = hidden_act.matmul(&down.t()?)?; // [n, hidden]
+            let down_linear = self.down_proj.expert_linear(expert_idx)?;
+            let expert_out = hidden_act.apply(&down_linear)?; // [n, hidden]
 
             // Scale by routing weight and scatter-add.
             let w_tensor = Tensor::from_vec(tok_weights, n, device)?
