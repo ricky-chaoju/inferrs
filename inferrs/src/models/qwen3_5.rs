@@ -560,7 +560,9 @@ impl LinearAttn {
             out.unsqueeze(1)? // [b, 1, n_h, hv]
         } else {
             // Prefill path: chunked WY parallel scan
-            let out = gated_delta_rule_chunked(&q_f32, &k_f32, &v_f32, &g, &beta, &mut state)?;
+            // Pass log_g directly (not &g) to avoid log(0)=-inf on CUDA where
+            // subnormal floats are flushed to zero (FTZ mode).
+            let out = gated_delta_rule_chunked(&q_f32, &k_f32, &v_f32, &log_g, &beta, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out // already [b, t, n_h, hv]
         };
@@ -766,12 +768,10 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = x.clone();
         let normed = self.input_layernorm.forward(x)?;
-
         let attn_out = match &mut self.attn {
             LayerAttn::Full(a) => a.forward(&normed, seqlen_offset, cos, sin)?,
             LayerAttn::Linear(a) => a.forward(&normed)?,
         };
-
         let x = (residual + attn_out)?;
         let residual = x.clone();
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -796,13 +796,11 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = x.clone();
         let normed = self.input_layernorm.forward(x)?;
-
         let attn_out = match &mut self.attn {
             LayerAttn::Full(a) => a.forward_paged(&normed, seqlen_offset, ctx)?,
             // SSM layers are not paged — use their standard recurrent path.
             LayerAttn::Linear(a) => a.forward(&normed)?,
         };
-
         let x = (residual + attn_out)?;
         let residual = x.clone();
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -945,7 +943,7 @@ impl Qwen35Model {
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?; // [b, t, hidden]
 
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut() {
             x = layer.forward(&x, seqlen_offset, &self.cos, &self.sin)?;
         }
 
@@ -985,7 +983,7 @@ impl Qwen35Model {
         // Track which full-attention layer we are visiting so we index the
         // correct slice of kv_store.
         let mut full_attn_idx = 0usize;
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut() {
             let is_full = matches!(layer.attn, LayerAttn::Full(_));
             let mut ctx = PagedCtx {
                 cos: &self.cos,

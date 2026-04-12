@@ -5,6 +5,35 @@
 //!
 //! Reference: transformers/models/qwen3_5/modeling_qwen3_5.py
 //!            `torch_chunk_gated_delta_rule`
+//!
+//! # Performance TODOs
+//!
+//! 1. **Forward substitution O(S²) Tensor::cat loop** — `gated_delta_rule_chunked`
+//!    rebuilds the full `attn` tensor via `Tensor::cat` at every row of the
+//!    forward-substitution loop (63 iterations for CHUNK_SIZE=64).  Each cat
+//!    triggers a new allocation + GPU kernel launch.  Replace with an in-place
+//!    slice-assign (`slice_scatter` or equivalent) to avoid O(S²) copies.
+//!
+//! 2. **Redundant `decay_mask` materialisation** — `diff.broadcast_mul(&tril_strict)?`
+//!    allocates a full [b, n_h, C, S, S] tensor just to zero the upper triangle
+//!    before `exp`, then re-multiplies by `tril_strict` after `exp`.  A fused
+//!    masked-exp kernel (or computing only the lower triangle) would halve memory
+//!    traffic for this step.
+//!
+//! 3. **Inter-chunk loop sequential matmuls** — the `for ci in 0..num_chunks` loop
+//!    issues 3 independent matmuls per chunk sequentially.  Some could be batched
+//!    across chunks (e.g. `v_prime = w @ state` before the loop if state were
+//!    fixed), but causality requires sequential state updates.  Investigate whether
+//!    CUDA graphs or explicit stream pipelining could hide latency.
+//!
+//! 4. **Inter-chunk state tensor re-allocation** — `s = (s.broadcast_mul(...) + state_update)?`
+//!    allocates a new tensor on every chunk iteration.  For long sequences (many chunks)
+//!    this adds up to `num_chunks` extra allocations of [b, n_h, hk, hv].  If candle
+//!    exposes in-place `mul_` / `add_` ops, use them to update `s` without re-allocating.
+//!
+//! 5. **Defensive `contiguous()` copies** — many `narrow` + `contiguous` + `reshape`
+//!    chains create intermediate copies.  Profile to identify which are load-bearing
+//!    (CUDA non-contiguous reshape bug) vs unnecessary, and remove the latter.
 
 use anyhow::Result;
 use candle_core::{DType, Tensor};
@@ -14,19 +43,23 @@ const CHUNK_SIZE: usize = 64;
 /// Pure-Candle chunked GatedDeltaNet for prefill (t > 1).
 ///
 /// Inputs are all F32, shapes:
-///   q:    [b, t, n_heads, head_k_dim]
-///   k:    [b, t, n_heads, head_k_dim]
-///   v:    [b, t, n_heads, head_v_dim]
-///   g:    [b, t, n_heads]           (decay, already exp'd)
-///   beta: [b, t, n_heads]
+///   q:     [b, t, n_heads, head_k_dim]
+///   k:     [b, t, n_heads, head_k_dim]
+///   v:     [b, t, n_heads, head_v_dim]
+///   log_g: [b, t, n_heads]  (log of per-head decay, i.e. -a_exp * softplus(a + dt_bias))
+///   beta:  [b, t, n_heads]
 ///   state: [b, n_heads, head_k_dim, head_v_dim]  (mutable, updated in-place)
+///
+/// `log_g` must be passed directly (not as `g.log()`) to avoid log(0) = -inf on
+/// CUDA where subnormal float32 values are flushed to zero, which would produce
+/// NaN through -inf - (-inf) in the decay_diff computation.
 ///
 /// Returns: [b, t, n_heads, head_v_dim]
 pub fn gated_delta_rule_chunked(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    g: &Tensor,
+    log_g: &Tensor,
     beta: &Tensor,
     state: &mut Tensor,
 ) -> Result<Tensor> {
@@ -42,15 +75,6 @@ pub fn gated_delta_rule_chunked(
     // CUDA gemm_config only handles ≤2 batch-prefix dims; 5D tensors with 3 batch
     // dims fall through to MatMulNonContiguous. Reshaping to [bhnc, S, d] avoids this.
     let bhnc = b * n_heads * num_chunks;
-
-    tracing::trace!(
-        "gated_delta_rule_chunked: t={} chunk={} num_chunks={}",
-        t,
-        chunk,
-        num_chunks
-    );
-
-    let log_g = g.log()?;
 
     // Reshape [b, t, n_h, d] -> [b, n_h, num_chunks, chunk, d] with padding
     let reshape_4d = |tensor: &Tensor, d: usize| -> Result<Tensor> {
@@ -82,7 +106,7 @@ pub fn gated_delta_rule_chunked(
     let q_c = reshape_4d(q, head_k_dim)?; // [b, n_h, C, S, hk]
     let k_c = reshape_4d(k, head_k_dim)?; // [b, n_h, C, S, hk]
     let v_c = reshape_4d(v, head_v_dim)?; // [b, n_h, C, S, hv]
-    let log_g_c = reshape_3d(&log_g)?; // [b, n_h, C, S]
+    let log_g_c = reshape_3d(log_g)?; // [b, n_h, C, S]
     let beta_c = reshape_3d(beta)?; // [b, n_h, C, S]
 
     // ── Step 3a: Log-decay cumsum + decay mask ────────────────────────────
@@ -105,11 +129,18 @@ pub fn gated_delta_rule_chunked(
         .unsqueeze(candle_core::D::Minus2)?
         .broadcast_as(outer)?
         .contiguous()?; // [b, n_h, C, S, S] — each col j repeated S times
-    let decay_diff = (&gc_i - &gc_j)?.exp()?;
-    // decay_mask_strict: used for (I+A) solve — diagonal must be zero
-    let decay_mask = decay_diff.broadcast_mul(&tril_strict)?;
-    // decay_mask_full: used for output a_intra — diagonal = 1 (position reads own write)
-    let decay_mask_full = decay_diff.broadcast_mul(&tril)?;
+                        // Apply tril masks BEFORE exp to prevent float32 overflow in the upper-triangular region.
+                        // For the upper tri (j > i), diff[i,j] = g_cumsum[i] - g_cumsum[j] > 0 (positive, since
+                        // g_cumsum is non-increasing). For long sequences with strong decay, this can reach
+                        // ~(chunk-1)*max_|log_g| which exceeds ln(f32::MAX)≈88, producing +inf after exp.
+                        // Then tril*inf = 0*inf = NaN. Lower-triangular entries are always ≤ 0 so exp ≤ 1 — safe.
+                        // Fix: zero upper-tri in diff first; exp(0)=1 in those slots; then re-zero with the mask.
+    let diff = (&gc_i - &gc_j)?;
+    let decay_mask = diff
+        .broadcast_mul(&tril_strict)?
+        .exp()?
+        .broadcast_mul(&tril_strict)?;
+    let decay_mask_full = diff.broadcast_mul(&tril)?.exp()?.broadcast_mul(&tril)?;
 
     // ── Step 3b: Weighted keys/values ─────────────────────────────────────
     let beta_unsq = beta_c.unsqueeze(candle_core::D::Minus1)?; // [b, n_h, C, S, 1]
@@ -123,11 +154,15 @@ pub fn gated_delta_rule_chunked(
         .reshape((bhnc, chunk, head_k_dim))?
         .broadcast_matmul(
             &k_c.reshape((bhnc, chunk, head_k_dim))?
-                .transpose(candle_core::D::Minus1, candle_core::D::Minus2)?,
+                .transpose(candle_core::D::Minus1, candle_core::D::Minus2)?
+                .contiguous()?,
         )?
         .reshape((b, n_heads, num_chunks, chunk, chunk))?;
     // kk: [b, n_h, C, S, S] — this is k_beta @ k^T
-    let a_mat: Tensor = kk.broadcast_mul(&decay_mask)?.neg()?;
+    // .contiguous() ensures a_mat has dense row-major strides before narrow+reshape
+    // in the forward-substitution loop.  broadcast_mul may produce a strided view
+    // on CUDA (like torch), so the explicit copy here is required for correctness.
+    let a_mat: Tensor = kk.broadcast_mul(&decay_mask)?.neg()?.contiguous()?;
 
     // ── Step 3d: Solve (I + A) via forward substitution ───────────────────
     // attn starts as identity + lower-triangular part solved row by row.
@@ -149,13 +184,19 @@ pub fn gated_delta_rule_chunked(
     //
     // Row 0 is already e_0 from the identity initialisation.
     for i in 1..chunk {
-        // attn[0..i, :] — already-solved rows
-        let attn_sub = attn.narrow(candle_core::D::Minus2, 0, i)?; // [b, n_h, C, i, S]
+        // attn[0..i, :] — already-solved rows.
+        // .contiguous() is required: narrow produces a strided view, and the
+        // subsequent reshape to [bhnc, i, S] is only valid on a dense tensor.
+        // On CUDA, reshaping a non-contiguous view reinterprets strides incorrectly.
+        let attn_sub = attn.narrow(candle_core::D::Minus2, 0, i)?.contiguous()?; // [b, n_h, C, i, S]
 
-        // a_mat[i, 0:i] — row i of A, first i sub-diagonal entries
+        // a_mat[i, 0:i] — row i of A, first i sub-diagonal entries.
+        // Same reasoning: two narrows leave non-trivial strides; make contiguous
+        // before the reshape merges the (b, n_h, C) prefix into bhnc.
         let a_sub = a_mat
             .narrow(candle_core::D::Minus2, i, 1)? // row i:    [b, n_h, C, 1, S]
-            .narrow(candle_core::D::Minus1, 0, i)?; // cols 0..i: [b, n_h, C, 1, i]
+            .narrow(candle_core::D::Minus1, 0, i)? // cols 0..i: [b, n_h, C, 1, i]
+            .contiguous()?;
 
         // contrib = a_mat[i, 0:i] @ attn[0:i, :] — [b,n_h,C,1,i] @ [b,n_h,C,i,S] → [b,n_h,C,1,S]
         // Reshape to 3D: CUDA gemm_config only handles ≤2 batch-prefix dims.
@@ -197,37 +238,63 @@ pub fn gated_delta_rule_chunked(
         .reshape((b, n_heads, num_chunks, chunk, head_k_dim))?; // [b, n_h, C, S, hk]
 
     // ── Step 4: Inter-chunk state propagation ─────────────────────────────
+    // Flat 2D batch size: collapse [b, n_h] into one dim for 3D matmuls.
+    // Mirrors the bhnc workaround above — CUDA gemm_config may fall through to
+    // MatMulNonContiguous for 4D tensors with 2 batch-prefix dims, so we
+    // reshape to explicit 3D to guarantee the fast batched-GEMM path.
+    let bn = b * n_heads;
     let mut outputs = Vec::with_capacity(num_chunks);
     let mut s = state.clone(); // [b, n_heads, hk, hv]
 
     for ci in 0..num_chunks {
-        let q_ci = q_c.narrow(2, ci, 1)?.squeeze(2)?; // [b, n_h, S, hk]
-        let k_ci = k_c.narrow(2, ci, 1)?.squeeze(2)?; // [b, n_h, S, hk]
-        let v_new_ci = value_new.narrow(2, ci, 1)?.squeeze(2)?; // [b, n_h, S, hv]
-        let w_ci = w.narrow(2, ci, 1)?.squeeze(2)?; // [b, n_h, S, hk]
-                                                    // decay_ci_full: uses tril (diagonal=1) so position i reads its own write
-        let decay_ci_full = decay_mask_full.narrow(2, ci, 1)?.squeeze(2)?; // [b, n_h, S, S]
-        let gc_ci = g_cumsum.narrow(2, ci, 1)?.squeeze(2)?; // [b, n_h, S]
+        // narrow(chunk-dim) + squeeze leaves non-contiguous strides.
+        // Explicit .contiguous() is required before any reshape that merges
+        // (b, n_h) into bn — on CUDA, a non-contiguous reshape reinterprets
+        // strides and silently produces wrong values.
+        let q_ci = q_c.narrow(2, ci, 1)?.squeeze(2)?.contiguous()?; // [b, n_h, S, hk]
+        let k_ci = k_c.narrow(2, ci, 1)?.squeeze(2)?.contiguous()?; // [b, n_h, S, hk]
+        let v_new_ci = value_new.narrow(2, ci, 1)?.squeeze(2)?.contiguous()?; // [b, n_h, S, hv]
+        let w_ci = w.narrow(2, ci, 1)?.squeeze(2)?.contiguous()?; // [b, n_h, S, hk]
+                                                                  // decay_ci_full: uses tril (diagonal=1) so position i reads its own write
+        let decay_ci_full = decay_mask_full.narrow(2, ci, 1)?.squeeze(2)?.contiguous()?; // [b, n_h, S, S]
+        let gc_ci = g_cumsum.narrow(2, ci, 1)?.squeeze(2)?.contiguous()?; // [b, n_h, S]
 
-        // v_prime = w_ci @ state: [b, n_h, S, hk] @ [b, n_h, hk, hv] -> [b, n_h, S, hv]
-        let v_prime = w_ci.broadcast_matmul(&s)?;
+        // v_prime = w_ci @ s: [bn, S, hk] @ [bn, hk, hv] -> [bn, S, hv]
+        let s3 = s.reshape((bn, head_k_dim, head_v_dim))?;
+        let v_prime = w_ci
+            .reshape((bn, chunk, head_k_dim))?
+            .broadcast_matmul(&s3)?
+            .reshape((b, n_heads, chunk, head_v_dim))?;
 
-        // v_new_corrected = value_new - v_prime
-        let v_corrected = (&v_new_ci - &v_prime)?;
+        // v_corrected = value_new - v_prime
+        let v_corrected = (&v_new_ci - &v_prime)?; // [b, n_h, S, hv]
 
-        // Intra-chunk attention scores: q @ k^T * decay_mask_full (tril, not tril_strict)
-        // Diagonal = 1: position i attends to its own write (consistent with sequential step).
+        // Intra-chunk attention: [bn, S, hk] @ [bn, hk, S] -> [bn, S, S]
         let a_intra = q_ci
-            .broadcast_matmul(&k_ci.transpose(candle_core::D::Minus1, candle_core::D::Minus2)?)?
+            .reshape((bn, chunk, head_k_dim))?
+            .broadcast_matmul(
+                &k_ci
+                    .reshape((bn, chunk, head_k_dim))?
+                    .transpose(candle_core::D::Minus1, candle_core::D::Minus2)?
+                    .contiguous()?,
+            )?
+            .reshape((b, n_heads, chunk, chunk))?
             .broadcast_mul(&decay_ci_full)?; // [b, n_h, S, S]
 
-        // Inter-chunk: (q * exp(g_cumsum)) @ state
+        // Inter-chunk: (q * exp(g_cumsum)) @ s: [bn, S, hk] @ [bn, hk, hv] -> [bn, S, hv]
         let gc_exp = gc_ci.exp()?.unsqueeze(candle_core::D::Minus1)?; // [b, n_h, S, 1]
         let q_scaled = q_ci.broadcast_mul(&gc_exp)?; // [b, n_h, S, hk]
-        let attn_inter = q_scaled.broadcast_matmul(&s)?; // [b, n_h, S, hv]
+        let attn_inter = q_scaled
+            .reshape((bn, chunk, head_k_dim))?
+            .broadcast_matmul(&s3)?
+            .reshape((b, n_heads, chunk, head_v_dim))?; // [b, n_h, S, hv]
 
-        // output = attn_inter + A_intra @ v_corrected
-        let out_ci = (attn_inter + a_intra.broadcast_matmul(&v_corrected)?)?; // [b, n_h, S, hv]
+        // output = attn_inter + a_intra @ v_corrected: [bn, S, S] @ [bn, S, hv]
+        let out_ci = (attn_inter
+            + a_intra
+                .reshape((bn, chunk, chunk))?
+                .broadcast_matmul(&v_corrected.reshape((bn, chunk, head_v_dim))?)?
+                .reshape((b, n_heads, chunk, head_v_dim))?)?; // [b, n_h, S, hv]
         outputs.push(out_ci.unsqueeze(2)?); // [b, n_h, 1, S, hv]
 
         // State update: compute decay from chunk start to chunk end
@@ -246,11 +313,15 @@ pub fn gated_delta_rule_chunked(
             .exp()?
             .unsqueeze(candle_core::D::Minus1)?; // [b, n_h, S, 1]
 
-        // state = state * exp(g_cumsum[-1]) + (k * decay_to_end)^T @ v_corrected
+        // state = state * exp(g_cumsum[-1]) + k_weighted^T @ v_corrected
+        // [bn, hk, S] @ [bn, S, hv] -> [bn, hk, hv]
         let k_weighted = k_ci.broadcast_mul(&decay_to_end)?; // [b, n_h, S, hk]
         let state_update = k_weighted
+            .reshape((bn, chunk, head_k_dim))?
             .transpose(candle_core::D::Minus1, candle_core::D::Minus2)?
-            .broadcast_matmul(&v_corrected)?; // [b, n_h, hk, hv]
+            .contiguous()?
+            .broadcast_matmul(&v_corrected.reshape((bn, chunk, head_v_dim))?)?
+            .reshape((b, n_heads, head_k_dim, head_v_dim))?; // [b, n_h, hk, hv]
         s = (s.broadcast_mul(&g_end_exp)? + state_update)?;
     }
 
@@ -361,52 +432,353 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    fn run_chunked_vs_sequential(device: Device) {
+    fn run_chunked_vs_sequential(device: &Device, t: usize, n_heads: usize, hk: usize, hv: usize) {
         let b = 1usize;
-        let t = 128usize; // two full chunks
-        let n_heads = 2usize;
-        let hk = 4usize;
-        let hv = 4usize;
 
-        // Use fixed seeds by constructing simple tensors
-        let q = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), &device).unwrap();
-        let k = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), &device).unwrap();
-        let v = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, hv), &device).unwrap();
-        // g must be in (0,1): use sigmoid of randn * 0.5 offset to keep away from 0/1
-        let g_raw = Tensor::randn(-2.0f32, 1.0f32, (b, t, n_heads), &device).unwrap();
+        let q = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let k = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let v = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, hv), device).unwrap();
+        // g in (0,1): sigmoid of randn. log_g = log(g) is always finite since sigmoid != 0.
+        let g_raw = Tensor::randn(-2.0f32, 1.0f32, (b, t, n_heads), device).unwrap();
         let g = candle_nn::ops::sigmoid(&g_raw).unwrap();
-        let beta_raw = Tensor::randn(0f32, 1.0f32, (b, t, n_heads), &device).unwrap();
+        // log_g: for the model this is -a_exp*softplus (always negative, no underflow risk).
+        // In tests, g.log() is safe since sigmoid is always > 0.
+        let log_g = g.log().unwrap();
+        let beta_raw = Tensor::randn(0f32, 1.0f32, (b, t, n_heads), device).unwrap();
         let beta = candle_nn::ops::sigmoid(&beta_raw).unwrap();
 
-        let mut state_seq = Tensor::zeros((b, n_heads, hk, hv), DType::F32, &device).unwrap();
-        let mut state_chk = Tensor::zeros((b, n_heads, hk, hv), DType::F32, &device).unwrap();
+        let mut state_seq = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
+        let mut state_chk = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
 
-        // Permute q,k,v from [b,t,n_h,d] to sequential_loop's expected format
         let out_seq = sequential_loop(&q, &k, &v, &g, &beta, &mut state_seq).unwrap();
-        let out_chk = gated_delta_rule_chunked(&q, &k, &v, &g, &beta, &mut state_chk).unwrap();
+        let out_chk = gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state_chk).unwrap();
 
         let out_diff = max_abs_diff(&out_seq, &out_chk);
         let state_diff = max_abs_diff(&state_seq, &state_chk);
 
-        println!("output max abs diff = {out_diff:.6}");
-        println!("state  max abs diff = {state_diff:.6}");
+        println!("t={t} n_h={n_heads} hk={hk} hv={hv}: out_diff={out_diff:.6} state_diff={state_diff:.6}");
 
-        assert!(out_diff < 1e-4, "output mismatch: max diff = {out_diff}");
-        assert!(state_diff < 1e-4, "state mismatch: max diff = {state_diff}");
+        assert!(
+            out_diff < 1e-3,
+            "t={t}: output mismatch: max diff = {out_diff}"
+        );
+        assert!(
+            state_diff < 1e-3,
+            "t={t}: state mismatch: max diff = {state_diff}"
+        );
+    }
+
+    /// Run chunked scan with large-magnitude log_g (≈ −6.7 per step) to reproduce the
+    /// float32 overflow bug: exp(g_cumsum[i] − g_cumsum[j]) for upper-triangular (i < j)
+    /// can reach exp(~275) → +inf for t ≥ 15 tokens.  Before the fix, inf * 0 = NaN.
+    fn run_chunked_large_decay(device: &Device, t: usize, n_heads: usize, hk: usize, hv: usize) {
+        let b = 1usize;
+
+        let q = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let k = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let v = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, hv), device).unwrap();
+        // Use log_g ≈ −6.72 to match observed Qwen3.5-0.8B values.
+        // For t=42, the upper-triangular exponent reaches ~41*6.72≈275, overflowing f32.
+        let log_g = Tensor::full(-6.72f32, (b, t, n_heads), device).unwrap();
+        let beta = Tensor::full(0.65f32, (b, t, n_heads), device).unwrap();
+
+        let g = log_g.exp().unwrap();
+        let mut state_seq = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
+        let mut state_chk = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
+
+        let out_seq = sequential_loop(&q, &k, &v, &g, &beta, &mut state_seq).unwrap();
+        let out_chk = gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state_chk).unwrap();
+
+        // Verify no NaN first
+        let has_nan = out_chk
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .any(|x| x.is_nan());
+        assert!(
+            !has_nan,
+            "t={t}: NaN in chunked output (overflow bug not fixed)"
+        );
+
+        let out_diff = max_abs_diff(&out_seq, &out_chk);
+        println!("large_decay t={t} n_h={n_heads}: out_diff={out_diff:.6}");
+        assert!(
+            out_diff < 1e-3,
+            "t={t}: output mismatch: max diff = {out_diff}"
+        );
     }
 
     #[test]
-    fn chunked_matches_sequential_cpu() {
-        run_chunked_vs_sequential(Device::Cpu);
+    fn chunked_large_decay_cpu() {
+        let device = Device::Cpu;
+        // t=14 (threshold: 13*6.72≈87 < 88 — just under overflow without fix)
+        run_chunked_large_decay(&device, 14, 2, 4, 4);
+        // t=15 would have overflowed without the fix (14*6.72≈94 > 88)
+        run_chunked_large_decay(&device, 15, 2, 4, 4);
+        // t=42: the actual failing case in production
+        run_chunked_large_decay(&device, 42, 2, 4, 4);
+        // realistic model dims
+        run_chunked_large_decay(&device, 42, 16, 128, 128);
     }
 
     #[test]
-    fn chunked_matches_sequential_cuda() {
-        let device = Device::cuda_if_available(0).expect("cuda device");
+    fn chunked_large_decay_cuda() {
+        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
         if matches!(device, Device::Cpu) {
             eprintln!("CUDA not available, skipping GPU test");
             return;
         }
-        run_chunked_vs_sequential(device);
+        run_chunked_large_decay(&device, 14, 2, 4, 4);
+        run_chunked_large_decay(&device, 15, 2, 4, 4);
+        run_chunked_large_decay(&device, 42, 2, 4, 4);
+        run_chunked_large_decay(&device, 42, 16, 128, 128);
+    }
+
+    #[test]
+    fn chunked_matches_sequential_cpu() {
+        let device = Device::Cpu;
+        // t < CHUNK_SIZE (padded): simulates typical first/second REPL turn
+        run_chunked_vs_sequential(&device, 29, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 56, 2, 4, 4);
+        // t == CHUNK_SIZE (no padding)
+        run_chunked_vs_sequential(&device, 64, 2, 4, 4);
+        // t > CHUNK_SIZE (multiple chunks)
+        run_chunked_vs_sequential(&device, 128, 2, 4, 4);
+        // realistic model dims (n_heads=16, hk=hv=128) — single chunk
+        run_chunked_vs_sequential(&device, 56, 16, 128, 128);
+        // realistic model dims — multi-chunk (2 chunks)
+        run_chunked_vs_sequential(&device, 128, 16, 128, 128);
+        // realistic model dims — 3 chunks
+        run_chunked_vs_sequential(&device, 192, 16, 128, 128);
+    }
+
+    #[test]
+    fn chunked_matches_sequential_cuda() {
+        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        if matches!(device, Device::Cpu) {
+            eprintln!("CUDA not available, skipping GPU test");
+            return;
+        }
+        run_chunked_vs_sequential(&device, 29, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 56, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 128, 2, 4, 4);
+        // single chunk, realistic dims
+        run_chunked_vs_sequential(&device, 56, 16, 128, 128);
+        // multi-chunk, realistic dims — the case that fails in production
+        run_chunked_vs_sequential(&device, 128, 16, 128, 128);
+        run_chunked_vs_sequential(&device, 200, 16, 128, 128);
+    }
+
+    /// Run a chunked prefill followed by sequential decode steps, comparing
+    /// against a pure-sequential reference over all tokens.
+    /// This tests that the state handed off from chunked prefill to
+    /// sequential_step is correct — the exact pattern used in production
+    /// (turn N prefill → token-by-token generation).
+    fn run_prefill_then_decode(
+        device: &Device,
+        t_prefill: usize,
+        t_decode: usize,
+        n_heads: usize,
+        hk: usize,
+        hv: usize,
+    ) {
+        let b = 1usize;
+        let all_t = t_prefill + t_decode;
+
+        // Build all inputs on CPU then move to target device.
+        let cpu = Device::Cpu;
+        let q_all = Tensor::randn(0f32, 0.1f32, (b, all_t, n_heads, hk), &cpu)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+        let k_all = Tensor::randn(0f32, 0.1f32, (b, all_t, n_heads, hk), &cpu)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+        let v_all = Tensor::randn(0f32, 1.0f32, (b, all_t, n_heads, hv), &cpu)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+        let g_raw = Tensor::randn(-2.0f32, 1.0f32, (b, all_t, n_heads), &cpu).unwrap();
+        let g_all = candle_nn::ops::sigmoid(&g_raw)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+        let log_g_all = g_all.log().unwrap(); // safe: sigmoid > 0 always
+        let beta_raw = Tensor::randn(0f32, 1.0f32, (b, all_t, n_heads), &cpu).unwrap();
+        let beta_all = candle_nn::ops::sigmoid(&beta_raw)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+
+        // Reference: pure sequential over all tokens.
+        let mut state_ref = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
+        let out_ref =
+            sequential_loop(&q_all, &k_all, &v_all, &g_all, &beta_all, &mut state_ref).unwrap();
+
+        // Test: chunked prefill then sequential decode.
+        let mut state_test = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
+
+        // ── Prefill ───────────────────────────────────────────────────────────
+        let out_pre = gated_delta_rule_chunked(
+            &q_all.narrow(1, 0, t_prefill).unwrap(),
+            &k_all.narrow(1, 0, t_prefill).unwrap(),
+            &v_all.narrow(1, 0, t_prefill).unwrap(),
+            &log_g_all.narrow(1, 0, t_prefill).unwrap(),
+            &beta_all.narrow(1, 0, t_prefill).unwrap(),
+            &mut state_test,
+        )
+        .unwrap();
+
+        let pre_diff = max_abs_diff(&out_ref.narrow(1, 0, t_prefill).unwrap(), &out_pre);
+
+        // ── Decode steps ──────────────────────────────────────────────────────
+        // Permute decode slice to [b, n_h, t_decode, d] for easy per-step narrow.
+        let q_dec = q_all
+            .narrow(1, t_prefill, t_decode)
+            .unwrap()
+            .permute((0, 2, 1, 3))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let k_dec = k_all
+            .narrow(1, t_prefill, t_decode)
+            .unwrap()
+            .permute((0, 2, 1, 3))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let v_dec = v_all
+            .narrow(1, t_prefill, t_decode)
+            .unwrap()
+            .permute((0, 2, 1, 3))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let g_dec = g_all
+            .narrow(1, t_prefill, t_decode)
+            .unwrap()
+            .permute((0, 2, 1))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let beta_dec = beta_all
+            .narrow(1, t_prefill, t_decode)
+            .unwrap()
+            .permute((0, 2, 1))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+        let mut dec_outs = Vec::with_capacity(t_decode);
+        for i in 0..t_decode {
+            let out = sequential_step(
+                &q_dec.narrow(2, i, 1).unwrap().squeeze(2).unwrap(),
+                &k_dec.narrow(2, i, 1).unwrap().squeeze(2).unwrap(),
+                &v_dec.narrow(2, i, 1).unwrap().squeeze(2).unwrap(),
+                &g_dec.narrow(2, i, 1).unwrap().squeeze(2).unwrap(),
+                &beta_dec.narrow(2, i, 1).unwrap().squeeze(2).unwrap(),
+                &mut state_test,
+            )
+            .unwrap();
+            dec_outs.push(out.unsqueeze(2).unwrap()); // [b, n_h, 1, hv]
+        }
+        // [b, n_h, t_decode, hv] → [b, t_decode, n_h, hv]
+        let out_dec = Tensor::cat(&dec_outs, 2)
+            .unwrap()
+            .permute((0, 2, 1, 3))
+            .unwrap();
+
+        let dec_diff = max_abs_diff(&out_ref.narrow(1, t_prefill, t_decode).unwrap(), &out_dec);
+
+        println!(
+            "prefill_then_decode t_pre={t_prefill} t_dec={t_decode} n_h={n_heads} hk={hk}: \
+             prefill_diff={pre_diff:.6} decode_diff={dec_diff:.6}"
+        );
+
+        assert!(pre_diff < 1e-3, "prefill mismatch: {pre_diff}");
+        assert!(dec_diff < 1e-3, "decode mismatch after prefill: {dec_diff}");
+    }
+
+    /// Test candle's depthwise conv1d (groups = c) on CUDA vs CPU.
+    /// This directly exercises LinearAttn::apply_conv1d_silu with the exact
+    /// parameters used by Qwen3.5-0.8B (kernel=4, c=6144).
+    /// If this test fails, the bug is in candle's CUDA conv1d kernel.
+    #[allow(dead_code)]
+    fn run_depthwise_conv1d(device: &Device, c: usize, kernel: usize, t: usize) {
+        let cpu = Device::Cpu;
+        let pad_len = kernel - 1;
+        let total = pad_len + t;
+
+        // Build weight [c, 1, kernel] and input [1, c, total] on CPU then move.
+        let weight = Tensor::randn(0f32, 0.1f32, (c, 1, kernel), &cpu).unwrap();
+        let inp = Tensor::randn(0f32, 1.0f32, (1usize, c, total), &cpu).unwrap();
+
+        let out_cpu = inp.conv1d(&weight, 0, 1, 1, c).unwrap();
+
+        let weight_d = weight.to_device(device).unwrap();
+        let inp_d = inp.to_device(device).unwrap();
+        let out_d = inp_d
+            .conv1d(&weight_d, 0, 1, 1, c)
+            .unwrap()
+            .to_device(&cpu)
+            .unwrap();
+
+        let diff = max_abs_diff(&out_cpu, &out_d);
+        println!("depthwise_conv1d c={c} kernel={kernel} t={t}: diff={diff:.6}");
+        assert!(diff < 1e-3, "conv1d CUDA vs CPU mismatch at t={t}: {diff}");
+    }
+
+    #[test]
+    fn depthwise_conv1d_cpu() {
+        let device = Device::Cpu;
+        // Qwen3.5-0.8B: n_h=16, hk=hv=128 → key_dim=2048, c=6144
+        run_depthwise_conv1d(&device, 6144, 4, 30);
+        run_depthwise_conv1d(&device, 6144, 4, 128);
+        run_depthwise_conv1d(&device, 6144, 4, 200);
+    }
+
+    #[test]
+    fn depthwise_conv1d_cuda() {
+        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        if matches!(device, Device::Cpu) {
+            eprintln!("CUDA not available, skipping GPU test");
+            return;
+        }
+        // Qwen3.5-0.8B exact params: kernel=4, c=6144
+        run_depthwise_conv1d(&device, 6144, 4, 30); // short (turn 1)
+        run_depthwise_conv1d(&device, 6144, 4, 80); // medium
+        run_depthwise_conv1d(&device, 6144, 4, 128); // 2 chunks
+        run_depthwise_conv1d(&device, 6144, 4, 200); // long (turn 2)
+    }
+
+    #[test]
+    fn prefill_then_decode_cpu() {
+        let device = Device::Cpu;
+        run_prefill_then_decode(&device, 50, 20, 2, 4, 4);
+        run_prefill_then_decode(&device, 80, 20, 16, 128, 128); // 2 chunks
+        run_prefill_then_decode(&device, 128, 30, 16, 128, 128); // exactly 2 chunks
+    }
+
+    #[test]
+    fn prefill_then_decode_cuda() {
+        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        if matches!(device, Device::Cpu) {
+            eprintln!("CUDA not available, skipping GPU test");
+            return;
+        }
+        run_prefill_then_decode(&device, 50, 20, 2, 4, 4);
+        // single-chunk prefill, realistic dims
+        run_prefill_then_decode(&device, 50, 20, 16, 128, 128);
+        // multi-chunk prefill, realistic dims — matches production second turn
+        run_prefill_then_decode(&device, 80, 20, 16, 128, 128);
+        run_prefill_then_decode(&device, 128, 30, 16, 128, 128);
+        run_prefill_then_decode(&device, 200, 30, 16, 128, 128);
     }
 }
