@@ -60,6 +60,18 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 2048)]
     pub max_tokens: usize,
 
+    /// Repetition penalty (llama.cpp style): divides positive logits and
+    /// multiplies negative logits of previously-seen tokens.
+    /// 1.0 = disabled (default).  Values around 1.1–1.3 reduce looping.
+    #[arg(long, default_value_t = 1.0)]
+    pub repetition_penalty: f64,
+
+    /// Frequency penalty (OpenAI style): subtracts `frequency_penalty × count`
+    /// from each token's logit, penalising tokens proportional to how often
+    /// they have appeared in the context.  0.0 = disabled (default).
+    #[arg(long, default_value_t = 0.0)]
+    pub frequency_penalty: f64,
+
     // ── Server connection ─────────────────────────────────────────────────────
     /// Address of the `inferrs serve` daemon.
     /// Overrides `INFERRS_HOST`.  Defaults to `127.0.0.1`.
@@ -165,6 +177,8 @@ struct SamplingParams {
     top_p: f64,
     top_k: usize,
     max_tokens: usize,
+    repetition_penalty: f64,
+    frequency_penalty: f64,
 }
 
 impl SamplingParams {
@@ -174,6 +188,8 @@ impl SamplingParams {
             top_p: args.top_p,
             top_k: args.top_k,
             max_tokens: args.max_tokens,
+            repetition_penalty: args.repetition_penalty,
+            frequency_penalty: args.frequency_penalty,
         }
     }
 }
@@ -209,6 +225,17 @@ struct ChatOptions {
     top_p: f64,
     top_k: usize,
     num_predict: usize,
+    #[serde(skip_serializing_if = "is_one")]
+    repeat_penalty: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    frequency_penalty: f64,
+}
+
+fn is_one(v: &f64) -> bool {
+    (*v - 1.0).abs() < 1e-9
+}
+fn is_zero(v: &f64) -> bool {
+    v.abs() < 1e-9
 }
 
 /// One NDJSON line from a streaming `/api/chat` response.
@@ -305,6 +332,8 @@ async fn chat_stream(
             top_p: params.top_p,
             top_k: params.top_k,
             num_predict: params.max_tokens,
+            repeat_penalty: params.repetition_penalty,
+            frequency_penalty: params.frequency_penalty,
         }),
     };
 
@@ -353,7 +382,7 @@ async fn audio_stream(
         ]
     }));
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
@@ -362,6 +391,12 @@ async fn audio_stream(
         "top_p": params.top_p,
         "top_k": params.top_k,
     });
+    if !is_one(&params.repetition_penalty) {
+        body["repetition_penalty"] = serde_json::json!(params.repetition_penalty);
+    }
+    if !is_zero(&params.frequency_penalty) {
+        body["frequency_penalty"] = serde_json::json!(params.frequency_penalty);
+    }
 
     let response = client
         .post(&url)
@@ -687,6 +722,8 @@ async fn repl(
     let mut top_p = args.top_p;
     let mut top_k = args.top_k;
     let mut max_tokens = args.max_tokens;
+    let repetition_penalty = args.repetition_penalty;
+    let frequency_penalty = args.frequency_penalty;
 
     let mut multiline = MultilineState::None;
     let mut buf = String::new();
@@ -790,6 +827,8 @@ async fn repl(
                 top_p,
                 top_k,
                 max_tokens,
+                repetition_penalty,
+                frequency_penalty,
             },
         )
         .await
