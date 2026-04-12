@@ -86,6 +86,7 @@ pub fn download_model(
     model_id: &str,
     revision: &str,
     gguf_file: Option<&str>,
+    tokenizer_source: Option<&str>,
 ) -> Result<ModelFiles> {
     // If the model_id looks like a local path, load directly without network.
     let as_path = std::path::Path::new(model_id);
@@ -108,7 +109,7 @@ pub fn download_model(
 
     // Fast-path: caller explicitly asked for a specific GGUF file.
     if let Some(fname) = gguf_file {
-        return download_gguf_only_repo(&repo, &api, model_id, fname);
+        return download_gguf_only_repo(&repo, &api, model_id, fname, tokenizer_source);
     }
 
     // Probe for config.json.  If it is missing the repo is likely GGUF-only
@@ -117,7 +118,7 @@ pub fn download_model(
     if config_result.is_err() {
         tracing::info!("config.json not found in {model_id} — checking for GGUF-only repo");
         let gguf_fname = pick_best_gguf_file(&repo, model_id)?;
-        return download_gguf_only_repo(&repo, &api, model_id, &gguf_fname);
+        return download_gguf_only_repo(&repo, &api, model_id, &gguf_fname, tokenizer_source);
     }
     let config_path = config_result.expect("checked above");
     tracing::info!("Downloaded config.json");
@@ -195,6 +196,7 @@ fn download_gguf_only_repo(
     api: &Api,
     model_id: &str,
     gguf_filename: &str,
+    tokenizer_source: Option<&str>,
 ) -> Result<ModelFiles> {
     tracing::info!("Downloading GGUF file: {gguf_filename}");
     let gguf_path = repo
@@ -203,7 +205,11 @@ fn download_gguf_only_repo(
     tracing::info!("Downloaded {gguf_filename}");
 
     // Read GGUF metadata to find the source model repo.
-    let source_repo_id = read_gguf_source_repo(&gguf_path)?;
+    let source_repo_id = if let Some(ts) = tokenizer_source {
+        Some(ts.to_string())
+    } else {
+        read_gguf_source_repo(&gguf_path)?
+    };
 
     let (config_path, tokenizer_path, tokenizer_config_path) = match source_repo_id {
         Some(ref src) => {
@@ -289,9 +295,10 @@ pub fn download_and_maybe_quantize(
     model_id: &str,
     revision: &str,
     gguf_file: Option<&str>,
+    tokenizer_source: Option<&str>,
     quant_dtype: Option<GgmlDType>,
 ) -> Result<ModelFiles> {
-    let mut files = download_model(model_id, revision, gguf_file)?;
+    let mut files = download_model(model_id, revision, gguf_file, tokenizer_source)?;
 
     let Some(dtype) = quant_dtype else {
         return Ok(files);
