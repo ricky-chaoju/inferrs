@@ -67,18 +67,22 @@ test:
 
 # Go C shared library for OCI registry pulls (called via FFI from Rust).
 oci-lib:
+	mkdir -p target/debug
 	cd oci-pull && CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
 		$(GO_INSTALL_NAME) \
 		-o ../target/debug/libocipull.$(LIB_EXT) .
 
 oci-lib-release:
+	mkdir -p target/release
 	cd oci-pull && CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
 		-trimpath $(GO_INSTALL_NAME_RELEASE) \
 		-o ../target/release/libocipull.$(LIB_EXT) .
 
 # Standalone CLI binary (optional, useful for debugging).
 oci-pull:
+	mkdir -p target/debug
 	cd oci-pull && go build -o ../target/debug/inferrs-oci-pull .
 
 oci-pull-release:
+	mkdir -p target/release
 	cd oci-pull && go build -trimpath -ldflags='-s -w' -o ../target/release/inferrs-oci-pull .
