@@ -1,0 +1,21 @@
+[package]
+name = "inferrs-kernels"
+version = "0.1.0"
+edition = "2021"
+description = "Patched GPU kernel crates for inferrs (Metal, CUDA)"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_kernels"
+crate-type = ["rlib"]
+
+[features]
+default = []
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-metal-kernels = { path = "candle-metal-kernels" }
+
+[target.'cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))'.dependencies]
+candle-kernels = { path = "candle-kernels" }
+
+[dependencies]

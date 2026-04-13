@@ -22,8 +22,8 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{linear_no_bias, rms_norm, Linear, RmsNorm, VarBuilder};
 
+use crate::audio_encoder::ClipLinear;
 use crate::config::Gemma4VisionConfig;
-use crate::models::audio_encoder::ClipLinear;
 
 // ---------------------------------------------------------------------------
 // Patch embedder

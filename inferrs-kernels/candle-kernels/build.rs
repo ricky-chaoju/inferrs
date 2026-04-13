@@ -81,10 +81,12 @@ fn main() {
         None if is_target_msvc => {
             let base = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA";
             // Newest first — the linker will use whichever exists.
-            ["v13.2", "v13.1", "v13.0", "v12.9", "v12.8", "v12.6", "v12.0"]
-                .iter()
-                .map(|v| format!("{base}/{v}"))
-                .collect()
+            [
+                "v13.2", "v13.1", "v13.0", "v12.9", "v12.8", "v12.6", "v12.0",
+            ]
+            .iter()
+            .map(|v| format!("{base}/{v}"))
+            .collect()
         }
         None => vec!["/usr/local/cuda".to_string()],
     };

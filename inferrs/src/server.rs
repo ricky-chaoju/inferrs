@@ -1744,9 +1744,9 @@ async fn chat_completions(
 
         // Number of audio soft tokens after two stride-2 conv layers (kernel=3, padding=1).
         // Each pass: out = floor((in - 1) / 2) + 1  (= ceil(in / 2)).
-        // Cap to AudioEncoder::MAX_MEL_FRAMES to match encoder truncation.
+        // Cap to MAX_MEL_FRAMES to match encoder truncation.
         let effective_mel_frames =
-            n_mel_frames.min(crate::models::audio_encoder::AudioEncoder::MAX_MEL_FRAMES);
+            n_mel_frames.min(crate::multimodal_plugin::AudioEncoderHandle::MAX_MEL_FRAMES);
         let after_pass1 = (effective_mel_frames.saturating_sub(1)) / 2 + 1;
         let n_audio_tokens = (after_pass1.saturating_sub(1)) / 2 + 1;
 

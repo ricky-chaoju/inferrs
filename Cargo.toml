@@ -3,6 +3,8 @@ members = [
     "inferrs",
     "inferrs-benchmark",
     "inferrs-models",
+    "inferrs-multimodal",
+    "inferrs-kernels",
     "backends/inferrs-backend-cann",
     "backends/inferrs-backend-cuda",
     "backends/inferrs-backend-musa",
@@ -26,6 +28,8 @@ default-members = [
     "inferrs",
     "inferrs-benchmark",
     "inferrs-models",
+    "inferrs-multimodal",
+    "inferrs-kernels",
     "backends/inferrs-backend-musa",
     "backends/inferrs-backend-vulkan",
     "backends/inferrs-backend-hexagon",
@@ -46,7 +50,7 @@ lto = true
 #   - SDPA vector kernel instantiations for head_dim=512 (Gemma4 global attention)
 #   - supported_head_dim check updated to include 512
 [patch.crates-io]
-candle-metal-kernels = { path = "candle-metal-kernels" }
+candle-metal-kernels = { path = "inferrs-kernels/candle-metal-kernels" }
 candle-nn = { path = "candle-nn" }
 candle-core = { path = "candle-core" }
-candle-kernels = { path = "candle-kernels" }
+candle-kernels = { path = "inferrs-kernels/candle-kernels" }
