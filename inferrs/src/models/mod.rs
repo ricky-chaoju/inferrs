@@ -4,14 +4,12 @@
 //! with a unified trait for the engine to use.
 
 pub mod attention_utils;
-pub mod audio_encoder;
 pub mod gemma4;
 mod gemma4_moe;
 pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod qwen3_5_linear_attn_scan;
-pub mod vision_encoder;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -19,6 +17,7 @@ use candle_nn::VarBuilder;
 use std::path::Path;
 
 use crate::config::{ModelArchitecture, RawConfig, VisionConfig};
+use crate::multimodal_plugin::{AudioEncoderHandle, MultimodalPlugin, VisionEncoderHandle};
 use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
 use quantized_linear::QGgufVarBuilder;
 
@@ -213,10 +212,10 @@ impl CausalLM for Qwen3ModelWrapper {
 /// A Gemma4 model wrapper (with optional audio and vision encoders).
 struct Gemma4ModelWrapper {
     inner: gemma4::Gemma4Model,
-    audio_encoder: Option<crate::models::audio_encoder::AudioEncoder>,
+    audio_encoder: Option<AudioEncoderHandle>,
     /// Pending audio: embeddings + positions of audio soft tokens in input_ids.
     pending_audio: Option<(Tensor, Vec<usize>)>,
-    vision_encoder: Option<crate::models::vision_encoder::VisionEncoder>,
+    vision_encoder: Option<VisionEncoderHandle>,
     /// Pending image: embeddings + positions of image soft tokens in input_ids.
     pending_image: Option<(Tensor, Vec<usize>)>,
 }
@@ -314,7 +313,7 @@ impl CausalLM for Gemma4ModelWrapper {
             .vision_encoder
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Gemma4 model was loaded without a vision tower"))?;
-        enc.encode(pixel_values, position_ids, Some(n_soft_tokens))
+        enc.encode(pixel_values, position_ids, n_soft_tokens)
     }
 
     fn set_pending_image(&mut self, embeds: Tensor, positions: Vec<usize>) {
@@ -934,9 +933,15 @@ pub fn load_model(
             );
             let inner = gemma4::Gemma4Model::new(&config, vb.clone(), qvb.as_ref(), gguf_path)?;
 
-            // Load audio encoder if audio_config is present in the model config.
-            // GGUF files typically only contain language model weights, so skip
-            // audio/vision encoder loading if the tensors are absent.
+            // Load audio and vision encoders via the inferrs-multimodal plugin.
+            // The plugin is dlopened from the same directory as the binary.
+            // GGUF files typically only contain LM weights; skip encoder loading
+            // when weight tensors are absent (plugin returns an error we treat as
+            // a soft skip).
+            let plugin = MultimodalPlugin::load();
+
+            let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
+
             let audio_encoder = if let Some(audio_cfg) = &raw_config.audio_config {
                 tracing::info!(
                     "Gemma4 audio encoder: {} layers, hidden={}, output_dims={}",
@@ -944,25 +949,37 @@ pub fn load_model(
                     audio_cfg.hidden_size,
                     audio_cfg.output_proj_dims,
                 );
-                match audio_encoder::AudioEncoder::load(
-                    vb.pp("model"),
-                    audio_cfg,
-                    config.hidden_size,
-                    device,
-                    dtype,
-                ) {
-                    Ok(enc) => {
-                        tracing::info!("Audio encoder loaded successfully");
-                        Some(enc)
-                    }
-                    Err(e)
-                        if gguf_path.is_some()
-                            && format!("{e:#}").contains("cannot find tensor") =>
-                    {
-                        tracing::warn!("Audio encoder weights not found in GGUF, skipping: {e:#}");
+                match &plugin {
+                    Err(e) => {
+                        tracing::warn!(
+                            "inferrs-multimodal plugin not available, audio encoder skipped: {e:#}"
+                        );
                         None
                     }
-                    Err(e) => return Err(e).context("Failed to load Gemma4 audio encoder"),
+                    Ok(plugin) => {
+                        let cfg_json = serde_json::to_string(audio_cfg)
+                            .context("Failed to serialize AudioConfig")?;
+                        match plugin.load_audio_encoder(
+                            &paths_ref,
+                            &cfg_json,
+                            config.hidden_size,
+                            dtype,
+                            device,
+                        ) {
+                            Ok(enc) => {
+                                tracing::info!("Audio encoder loaded successfully");
+                                Some(enc)
+                            }
+                            Err(e)
+                                if gguf_path.is_some()
+                                    && format!("{e:#}").contains("cannot find tensor") =>
+                            {
+                                tracing::warn!("Audio encoder weights not found, skipping: {e:#}");
+                                None
+                            }
+                            Err(e) => return Err(e).context("Failed to load Gemma4 audio encoder"),
+                        }
+                    }
                 }
             } else {
                 None
@@ -979,28 +996,41 @@ pub fn load_model(
                             cfg.patch_size,
                             cfg.default_output_length,
                         );
-                        match vision_encoder::VisionEncoder::load(
-                            vb.pp("model"),
-                            cfg,
-                            config.hidden_size,
-                            device,
-                            dtype,
-                        ) {
-                            Ok(enc) => {
-                                tracing::info!("Vision encoder loaded successfully");
-                                Some(enc)
-                            }
-                            Err(e)
-                                if gguf_path.is_some()
-                                    && format!("{e:#}").contains("cannot find tensor") =>
-                            {
+                        match &plugin {
+                            Err(e) => {
                                 tracing::warn!(
-                                    "Vision encoder weights not found in GGUF, skipping: {e:#}"
+                                    "inferrs-multimodal plugin not available, vision encoder skipped: {e:#}"
                                 );
                                 None
                             }
-                            Err(e) => {
-                                return Err(e).context("Failed to load Gemma4 vision encoder")
+                            Ok(plugin) => {
+                                let cfg_json = serde_json::to_string(cfg)
+                                    .context("Failed to serialize Gemma4VisionConfig")?;
+                                match plugin.load_vision_encoder(
+                                    &paths_ref,
+                                    &cfg_json,
+                                    config.hidden_size,
+                                    dtype,
+                                    device,
+                                ) {
+                                    Ok(enc) => {
+                                        tracing::info!("Vision encoder loaded successfully");
+                                        Some(enc)
+                                    }
+                                    Err(e)
+                                        if gguf_path.is_some()
+                                            && format!("{e:#}").contains("cannot find tensor") =>
+                                    {
+                                        tracing::warn!(
+                                            "Vision encoder weights not found, skipping: {e:#}"
+                                        );
+                                        None
+                                    }
+                                    Err(e) => {
+                                        return Err(e)
+                                            .context("Failed to load Gemma4 vision encoder")
+                                    }
+                                }
                             }
                         }
                     }

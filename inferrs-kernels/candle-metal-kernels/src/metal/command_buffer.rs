@@ -18,6 +18,12 @@ pub struct CommandSemaphore {
     pub status: Mutex<CommandStatus>,
 }
 
+impl Default for CommandSemaphore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommandSemaphore {
     pub fn new() -> CommandSemaphore {
         CommandSemaphore {

@@ -19,7 +19,7 @@ HEXAGON_PKG := -p inferrs-backend-hexagon
 # Packages that can be built/tested without GPU toolchains (CUDA, ROCm).
 # Both the Hexagon and OpenVINO backends have no exotic toolchain requirement
 # and can be built anywhere (they probe at runtime via dlopen/LoadLibrary).
-NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG)
+NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-multimodal -p inferrs-kernels -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG)
 
 .PHONY: all build release fmt clippy test ui
 

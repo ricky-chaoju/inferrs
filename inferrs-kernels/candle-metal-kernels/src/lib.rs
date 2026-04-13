@@ -1,3 +1,13 @@
+// Suppress clippy lints that fire on upstream vendored code we don't want to
+// diverge from unnecessarily.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::manual_is_multiple_of,
+    clippy::manual_div_ceil,
+    clippy::needless_borrow,
+    clippy::match_like_matches_macro
+)]
+
 pub mod err;
 pub mod kernel;
 pub mod kernels;

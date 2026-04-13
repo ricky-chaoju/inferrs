@@ -7,6 +7,7 @@ mod grammar;
 mod hub;
 mod list;
 mod models;
+mod multimodal_plugin;
 mod pull;
 mod quantize;
 mod rm;

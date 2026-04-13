@@ -1,0 +1,36 @@
+[package]
+name = "inferrs-multimodal"
+version = "0.1.0"
+edition = "2021"
+description = "Audio and image multimodal encoder plugins for inferrs"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_multimodal"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+anyhow = { workspace = true }
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+candle-core = { workspace = true, features = ["cuda"] }
+candle-nn = { workspace = true, features = ["cuda"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+candle-core = { workspace = true, features = ["cuda"] }
+candle-nn = { workspace = true, features = ["cuda"] }
