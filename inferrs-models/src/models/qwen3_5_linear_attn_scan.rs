@@ -103,6 +103,43 @@ pub fn gated_delta_rule_chunked(
     let log_g_c = reshape_3d(log_g)?; // [b, n_h, C, S]
     let beta_c = reshape_3d(beta)?; // [b, n_h, C, S]
 
+    // ── CUDA fast path ────────────────────────────────────────────────────────
+    // Flatten [b, n_h, C, S, d] → [b*n_h, C, S, d] and dispatch the monolithic
+    // kernel.  The candle path below is used on CPU and as a fallback.
+    #[cfg(feature = "cuda")]
+    if matches!(device, candle_core::Device::Cuda(_))
+        && matches!((head_k_dim, head_v_dim), (64, 64) | (128, 128))
+    {
+        let bn = b * n_heads;
+        let q_flat = q_c.reshape((bn, num_chunks, chunk, head_k_dim))?;
+        let k_flat = k_c.reshape((bn, num_chunks, chunk, head_k_dim))?;
+        let v_flat = v_c.reshape((bn, num_chunks, chunk, head_v_dim))?;
+        let logg_flat = log_g_c.reshape((bn, num_chunks, chunk))?;
+        let beta_flat = beta_c.reshape((bn, num_chunks, chunk))?;
+        let state_flat = state.reshape((bn, head_k_dim, head_v_dim))?.contiguous()?;
+
+        let (out_flat, new_state_flat) = candle_core::cuda_linear_attn_scan::cuda_linear_attn_scan(
+            &q_flat,
+            &k_flat,
+            &v_flat,
+            &logg_flat,
+            &beta_flat,
+            &state_flat,
+        )?;
+
+        *state = new_state_flat
+            .reshape((b, n_heads, head_k_dim, head_v_dim))?
+            .detach();
+
+        // out_flat: [b*n_h, C, S, hv] → [b, n_h, C, S, hv] → [b, pad_t, n_h, hv]
+        let out_perm = out_flat
+            .reshape((b, n_heads, num_chunks, chunk, head_v_dim))?
+            .permute((0, 2, 3, 1, 4))?
+            .contiguous()?
+            .reshape((b, pad_t, n_heads, head_v_dim))?;
+        return Ok(out_perm.narrow(1, 0, t)?);
+    }
+
     // ── Step 3a: Log-decay cumsum + decay mask ────────────────────────────
     // g_cumsum[i] = sum(log_g[0..i+1]) within each chunk
     let g_cumsum = log_g_c.cumsum(candle_core::D::Minus1)?; // [b, n_h, C, S]
