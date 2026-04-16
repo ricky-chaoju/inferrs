@@ -1,4 +1,9 @@
-/// CUDA dispatch for the monolithic GatedDeltaNet chunked scan kernel.
+/// CUDA dispatch for the 3-kernel FLA-style GatedDeltaNet chunked scan.
+///
+/// Three kernels run sequentially on the same CUDA stream:
+///   K1  linear_attn_intra   grid(B*NH*C) — KKT + fwd-subst + WY per chunk
+///   K2  linear_attn_state   grid(B*NH)   — sequential state scan, state in regs
+///   K3  linear_attn_output  grid(B*NH*C) — tiled qk + matmul per chunk
 ///
 /// Supports F32 and BF16 inputs for q/k/v.  log_g, beta, state are always F32.
 /// Output tensors (out, new_state) are always F32.
@@ -7,22 +12,9 @@
 /// (caller is responsible for reshaping before calling this function).
 /// State is `[B*NH, HK, HV]`.
 ///
-/// Returns `(out [B*NH, C, S, HV], new_state [B*NH, HK, HV])` as new F32 tensors.
-///
-/// Shared memory exceeds 48 KB for all supported configs; the kernel opts in to
-/// the 96 KB carveout via `set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`.
+/// Returns `(out [B*NH, C, S, HV], new_state [B*NH, HK, HV])` — both F32.
 use crate::{op::BackpropOp, DType, Result, Storage, Tensor};
 
-/// Launch the monolithic scan kernel.
-///
-/// Arguments (contiguous):
-///   q, k : `[b_nh, C, S, HK]`  — F32 or BF16
-///   v    : `[b_nh, C, S, HV]`  — same dtype as q
-///   log_g: `[b_nh, C, S]`      — F32
-///   beta : `[b_nh, C, S]`      — F32
-///   state: `[b_nh, HK, HV]`    — F32
-///
-/// Returns `(out [b_nh, C, S, HV], new_state [b_nh, HK, HV])` — both F32.
 pub fn cuda_linear_attn_scan(
     q: &Tensor,
     k: &Tensor,
@@ -49,36 +41,104 @@ pub fn cuda_linear_attn_scan(
         );
     }
 
-    let kernel_name = match (hk, hv, q.dtype()) {
-        (64,  64,  DType::F32)  => "gated_delta_net_scan_f32_hk64_hv64",
-        (64,  64,  DType::BF16) => "gated_delta_net_scan_bf16_hk64_hv64",
-        (128, 128, DType::F32)  => "gated_delta_net_scan_f32_hk128_hv128",
-        (128, 128, DType::BF16) => "gated_delta_net_scan_bf16_hk128_hv128",
-        _ => crate::bail!(
-            "cuda_linear_attn_scan: unsupported (hk={hk}, hv={hv}, dtype={:?}) — \
-             only (64,64) and (128,128) with F32 or BF16",
-            q.dtype()
+    let dtype_tag = match q.dtype() {
+        DType::F32  => "f32",
+        DType::BF16 => "bf16",
+        dt => crate::bail!(
+            "cuda_linear_attn_scan: unsupported dtype {dt:?} — only F32 or BF16"
         ),
     };
 
-    // Shared memory: (S*S + 3*S + S*HK + S*HV) * sizeof(float)
-    // s_kbeta and s_vcorr are always F32 in the kernel regardless of input dtype.
-    let shared_bytes =
-        ((s * s + 3 * s + s * hk + s * hv) * std::mem::size_of::<f32>()) as u32;
+    let (hk_tag, hv_tag) = match (hk, hv) {
+        (64,  64)  => ("64",  "64"),
+        (128, 128) => ("128", "128"),
+        _ => crate::bail!(
+            "cuda_linear_attn_scan: unsupported (hk={hk}, hv={hv}) — \
+             only (64,64) and (128,128)"
+        ),
+    };
 
-    let func = cuda_dev
-        .get_or_load_func(kernel_name, &kernels::LINEAR_ATTN_SCAN)
-        .map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+    let k1_name = format!("linear_attn_intra_{dtype_tag}_hk{hk_tag}_hv{hv_tag}");
+    let k2_name = format!("linear_attn_state_{dtype_tag}_hk{hk_tag}_hv{hv_tag}");
+    let k3_name = format!("linear_attn_output_{dtype_tag}_hk{hk_tag}_hv{hv_tag}");
 
-    // Opt-in to 96 KB dynamic shared memory (required for all supported configs).
-    func.set_attribute(
-        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        96 * 1024,
-    )
-    .map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+    // Shared memory sizes (bytes):
+    //   K1: s_attn[S*S] + s_a_row[S] + s_gcsum[S] + s_tile[S*64] + s_tile2[S*64]
+    //       = (4096 + 64 + 64 + 4096 + 4096) * 4 = 49664 B
+    //   K2: s_row[HK] = HK * 4
+    //   K3: s_attn[S*S] + s_q[S*64] + s_k[S*64] + s_gc[S]
+    //       = (4096 + 4096 + 4096 + 64) * 4 = 49408 B
+    let k1_smem = ((s * s + 2 * s + 2 * s * 64) * std::mem::size_of::<f32>()) as u32; // 64 = BK
+    // K2: s_row[HK] + s_partial[256] + s_vnew_cache[S*HV]
+    // s_partial has 256 elements always (N_GROUPS * HV = 256).
+    // s_vnew_cache caches the full vnew chunk in smem to avoid S global re-reads
+    // and S __syncthreads() in Step B.  Total: (128+256+8192)*4 = 34 KB < 48 KB.
+    let k2_smem = ((hk + 256 + s * hv) * std::mem::size_of::<f32>()) as u32;
+    let k3_smem = ((s * s + 2 * s * 64 + s) * std::mem::size_of::<f32>()) as u32; // 64 = BK=BV
 
-    // ── Extract read-only slices for log_g and beta (always F32) ─────────────
+    // Load and configure all three kernels.
+    let load_fn = |name: &str, smem: u32| -> Result<_> {
+        let func = cuda_dev
+            .get_or_load_func(name, &kernels::LINEAR_ATTN_SCAN)
+            .map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+        if smem > 48 * 1024 {
+            func.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                96 * 1024,
+            )
+            .map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+        }
+        Ok((func, smem))
+    };
+    let (f_k1, smem_k1) = load_fn(&k1_name, k1_smem)?;
+    let (f_k2, smem_k2) = load_fn(&k2_name, k2_smem)?;
+    let (f_k3, smem_k3) = load_fn(&k3_name, k3_smem)?;
 
+    // ── One workspace for all 5 intermediate F32 buffers ─────────────────────
+    // The CUDA driver allocator (cuMemAlloc) is not cached; a single allocation
+    // carved with split_at_mut avoids 5 separate round-trips.
+    let w_n   = b_nh * c * s * hk;
+    let u_n   = b_nh * c * s * hv;
+    let gc_n  = b_nh * c * s;
+    let ihv_n = b_nh * c * s * hv; // inter and vnew have identical shape
+    let mut workspace = unsafe {
+        cuda_dev
+            .alloc::<f32>(w_n + u_n + gc_n + ihv_n * 2)
+            .map_err(|e| crate::Error::Cuda(Box::new(e)))?
+    };
+    // Non-overlapping mutable views — safe because ranges are disjoint.
+    let (mut w_v,  mut rest) = workspace.split_at_mut(w_n);
+    let (mut u_v,  mut rest) = rest.split_at_mut(u_n);
+    let (mut gc_v, mut rest) = rest.split_at_mut(gc_n);
+    let (mut inter_v, mut vnew_v) = rest.split_at_mut(ihv_n);
+
+    // ── Output + state buffers (F32) ──────────────────────────────────────────
+    let out_buf = unsafe {
+        cuda_dev.alloc::<f32>(b_nh * c * s * hv)
+            .map_err(|e| crate::Error::Cuda(Box::new(e)))?
+    };
+
+    // Copy input state into mutable buffer (K2 reads and writes it).
+    let state_buf = {
+        let (st_stor, st_lay) = state.storage_and_layout();
+        let (st_o1, st_o2) = st_lay
+            .contiguous_offsets()
+            .ok_or_else(|| crate::Error::msg("state not contiguous"))?;
+        let src = match &*st_stor {
+            Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?.slice(st_o1..st_o2),
+            _ => crate::bail!("expected Cuda storage for state"),
+        };
+        let mut buf = unsafe {
+            cuda_dev.alloc::<f32>(b_nh * hk * hv)
+                .map_err(|e| crate::Error::Cuda(Box::new(e)))?
+        };
+        cuda_dev
+            .memcpy_dtod(&src, &mut buf)
+            .map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+        buf
+    };
+
+    // ── Extract log_g and beta slices (always F32) ────────────────────────────
     let (lg_stor, lg_lay) = log_g.storage_and_layout();
     let (lg_o1, lg_o2) = lg_lay
         .contiguous_offsets()
@@ -97,46 +157,9 @@ pub fn cuda_linear_attn_scan(
         _ => crate::bail!("expected Cuda storage for beta"),
     };
 
-    // ── Allocate output buffer (always F32) ───────────────────────────────────
-    let out_buf = unsafe {
-        cuda_dev
-            .alloc::<f32>(b_nh * c * s * hv)
-            .map_err(|e| crate::Error::Cuda(Box::new(e)))?
-    };
-
-    // ── Copy input state into a fresh mutable buffer (always F32) ────────────
-    // The kernel reads and writes state in-place across chunks.
-    let state_buf = {
-        let (st_stor, st_lay) = state.storage_and_layout();
-        let (st_o1, st_o2) = st_lay
-            .contiguous_offsets()
-            .ok_or_else(|| crate::Error::msg("state not contiguous"))?;
-        let src = match &*st_stor {
-            Storage::Cuda(cs) => cs.as_cuda_slice::<f32>()?.slice(st_o1..st_o2),
-            _ => crate::bail!("expected Cuda storage for state"),
-        };
-        let mut buf = unsafe {
-            cuda_dev
-                .alloc::<f32>(b_nh * hk * hv)
-                .map_err(|e| crate::Error::Cuda(Box::new(e)))?
-        };
-        cuda_dev
-            .memcpy_dtod(&src, &mut buf)
-            .map_err(|e| crate::Error::Cuda(Box::new(e)))?;
-        buf // st_stor guard dropped here; memcpy is on the same stream so it's safe
-    };
-
-    // ── Launch ────────────────────────────────────────────────────────────────
-    let cfg = cudarc::driver::LaunchConfig {
-        grid_dim: (b_nh as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: shared_bytes,
-    };
-
     let c_i = c as i32;
 
-    // Dispatch q/k/v slice extraction by dtype.  log_g, beta, state, out are
-    // always F32 and extracted once above.
+    // ── Dispatch by dtype ─────────────────────────────────────────────────────
     match q.dtype() {
         DType::F32 => {
             let (q_stor, q_lay) = q.storage_and_layout();
@@ -166,30 +189,74 @@ pub fn cuda_linear_attn_scan(
                 _ => crate::bail!("expected Cuda storage for v"),
             };
 
-            let mut b = func.builder();
-            b.arg(&q_sl);
-            b.arg(&k_sl);
-            b.arg(&v_sl);
-            b.arg(&lg_sl);
-            b.arg(&bt_sl);
-            b.arg(&state_buf);
-            b.arg(&out_buf);
-            b.arg(&c_i);
-            unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            // K1: grid=(b_nh*c,), produces w, u, gc
+            {
+                let cfg = cudarc::driver::LaunchConfig {
+                    grid_dim: ((b_nh * c) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_k1,
+                };
+                let mut b = f_k1.builder();
+                b.arg(&q_sl);
+                b.arg(&k_sl);
+                b.arg(&v_sl);
+                b.arg(&lg_sl);
+                b.arg(&bt_sl);
+                b.arg(&mut w_v);
+                b.arg(&mut u_v);
+                b.arg(&mut gc_v);
+                unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            }
+
+            // K2: grid=(b_nh,), produces inter, vnew, state_new
+            {
+                let cfg = cudarc::driver::LaunchConfig {
+                    grid_dim: (b_nh as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_k2,
+                };
+                let mut b = f_k2.builder();
+                b.arg(&mut w_v);
+                b.arg(&mut u_v);
+                b.arg(&mut gc_v);
+                b.arg(&k_sl);
+                b.arg(&q_sl);
+                b.arg(&state_buf);
+                b.arg(&mut inter_v);
+                b.arg(&mut vnew_v);
+                b.arg(&c_i);
+                unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            }
+
+            // K3: grid=(b_nh*c,), produces out
+            {
+                let cfg = cudarc::driver::LaunchConfig {
+                    grid_dim: ((b_nh * c) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_k3,
+                };
+                let mut b = f_k3.builder();
+                b.arg(&q_sl);
+                b.arg(&k_sl);
+                b.arg(&mut vnew_v);
+                b.arg(&mut inter_v);
+                b.arg(&mut gc_v);
+                b.arg(&out_buf);
+                unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            }
 
             drop(q_stor);
             drop(k_stor);
             drop(v_stor);
         }
+
         DType::BF16 => {
             let (q_stor, q_lay) = q.storage_and_layout();
             let (q_o1, q_o2) = q_lay
                 .contiguous_offsets()
                 .ok_or_else(|| crate::Error::msg("q not contiguous"))?;
             let q_sl = match &*q_stor {
-                Storage::Cuda(cs) => {
-                    cs.as_cuda_slice::<half::bf16>()?.slice(q_o1..q_o2)
-                }
+                Storage::Cuda(cs) => cs.as_cuda_slice::<half::bf16>()?.slice(q_o1..q_o2),
                 _ => crate::bail!("expected Cuda storage for q"),
             };
 
@@ -198,9 +265,7 @@ pub fn cuda_linear_attn_scan(
                 .contiguous_offsets()
                 .ok_or_else(|| crate::Error::msg("k not contiguous"))?;
             let k_sl = match &*k_stor {
-                Storage::Cuda(cs) => {
-                    cs.as_cuda_slice::<half::bf16>()?.slice(k_o1..k_o2)
-                }
+                Storage::Cuda(cs) => cs.as_cuda_slice::<half::bf16>()?.slice(k_o1..k_o2),
                 _ => crate::bail!("expected Cuda storage for k"),
             };
 
@@ -209,27 +274,71 @@ pub fn cuda_linear_attn_scan(
                 .contiguous_offsets()
                 .ok_or_else(|| crate::Error::msg("v not contiguous"))?;
             let v_sl = match &*v_stor {
-                Storage::Cuda(cs) => {
-                    cs.as_cuda_slice::<half::bf16>()?.slice(v_o1..v_o2)
-                }
+                Storage::Cuda(cs) => cs.as_cuda_slice::<half::bf16>()?.slice(v_o1..v_o2),
                 _ => crate::bail!("expected Cuda storage for v"),
             };
 
-            let mut b = func.builder();
-            b.arg(&q_sl);
-            b.arg(&k_sl);
-            b.arg(&v_sl);
-            b.arg(&lg_sl);
-            b.arg(&bt_sl);
-            b.arg(&state_buf);
-            b.arg(&out_buf);
-            b.arg(&c_i);
-            unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            // K1
+            {
+                let cfg = cudarc::driver::LaunchConfig {
+                    grid_dim: ((b_nh * c) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_k1,
+                };
+                let mut b = f_k1.builder();
+                b.arg(&q_sl);
+                b.arg(&k_sl);
+                b.arg(&v_sl);
+                b.arg(&lg_sl);
+                b.arg(&bt_sl);
+                b.arg(&mut w_v);
+                b.arg(&mut u_v);
+                b.arg(&mut gc_v);
+                unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            }
+
+            // K2
+            {
+                let cfg = cudarc::driver::LaunchConfig {
+                    grid_dim: (b_nh as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_k2,
+                };
+                let mut b = f_k2.builder();
+                b.arg(&mut w_v);
+                b.arg(&mut u_v);
+                b.arg(&mut gc_v);
+                b.arg(&k_sl);
+                b.arg(&q_sl);
+                b.arg(&state_buf);
+                b.arg(&mut inter_v);
+                b.arg(&mut vnew_v);
+                b.arg(&c_i);
+                unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            }
+
+            // K3
+            {
+                let cfg = cudarc::driver::LaunchConfig {
+                    grid_dim: ((b_nh * c) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_k3,
+                };
+                let mut b = f_k3.builder();
+                b.arg(&q_sl);
+                b.arg(&k_sl);
+                b.arg(&mut vnew_v);
+                b.arg(&mut inter_v);
+                b.arg(&mut gc_v);
+                b.arg(&out_buf);
+                unsafe { b.launch(cfg) }.map_err(|e| crate::Error::Cuda(Box::new(e)))?;
+            }
 
             drop(q_stor);
             drop(k_stor);
             drop(v_stor);
         }
+
         dt => crate::bail!("cuda_linear_attn_scan: unsupported dtype {dt:?}"),
     }
 
