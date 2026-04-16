@@ -204,18 +204,19 @@ pub struct ServeArgs {
 ///
 /// Disabling is safe as long as no tensors are shared across different
 /// CUDA streams, which is the case for inferrs.
-fn disable_cuda_event_tracking(_device: &candle_core::Device) {
-    // disable_event_tracking is only compiled in when candle-core has the
-    // "cuda" feature, which this crate enables via its own `cuda` feature
-    // on Linux / Windows x86_64 (CUDA is not available on Windows ARM).
-    #[cfg(all(
-        feature = "cuda",
-        any(
-            target_os = "linux",
-            all(target_os = "windows", target_arch = "x86_64")
-        )
-    ))]
-    if let candle_core::Device::Cuda(cuda_dev) = _device {
+///
+/// Only compiled when the `cuda` Cargo feature is enabled (otherwise the
+/// stub `CudaDevice` has no `disable_event_tracking` method and every call
+/// site is `#[cfg]`-out).
+#[cfg(all(
+    feature = "cuda",
+    any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    )
+))]
+fn disable_cuda_event_tracking(device: &candle_core::Device) {
+    if let candle_core::Device::Cuda(cuda_dev) = device {
         unsafe {
             cuda_dev.disable_event_tracking();
         }

@@ -1118,7 +1118,7 @@ fn is_cuda_uma_platform(_cuda_dev: &candle_core::CudaDevice) -> bool {
 
 /// Read `MemAvailable` from `/proc/meminfo` and return it in kibibytes.
 /// Returns `None` on any error (non-Linux, parse failure, etc.).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "android")))]
 fn read_proc_meminfo_available_kb() -> Option<usize> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in content.lines() {
