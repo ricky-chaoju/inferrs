@@ -53,8 +53,27 @@ pub fn compute_decay_gate_cuda(
     if dims.is_empty() {
         crate::bail!("compute_decay_gate_cuda: a_input must have at least 1 dim");
     }
-    let n_heads = dims[dims.len() - 1] as u32;
-    let n_total = a_input.elem_count() as u32;
+    let n_heads_usize = dims[dims.len() - 1];
+    let n_total_usize = a_input.elem_count();
+
+    // Empty input (any dim == 0): skip the kernel launch — grid_dim = 0 is an
+    // invalid CUDA launch config — and hand back a zero-element tensor with the
+    // same shape.
+    if n_total_usize == 0 {
+        return Tensor::zeros(a_input.shape(), DType::F32, a_input.device());
+    }
+
+    // The kernel indexes elements with u32. Realistic decay-gate tensors are
+    // small (b × seq × n_heads ≪ 2³² for any sane config), but bail explicitly
+    // rather than silently truncate if the invariant ever breaks.
+    if n_total_usize > u32::MAX as usize {
+        crate::bail!(
+            "compute_decay_gate_cuda: n_total ({}) exceeds u32::MAX; kernel indexing would overflow",
+            n_total_usize
+        );
+    }
+    let n_heads = n_heads_usize as u32;
+    let n_total = n_total_usize as u32;
 
     // Extract CUDA slices. Hold the read-guards for the duration of the launch.
     let (a_stor, a_lay) = a_input.storage_and_layout();

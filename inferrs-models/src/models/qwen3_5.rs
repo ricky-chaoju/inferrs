@@ -566,7 +566,9 @@ impl LinearAttn {
         // weight matrices once at load time so forward can issue a single matmul.
         // Saves 1 dispatch per SSM layer per decode token.
         let in_proj_ab_weight = match (in_proj_a.dense_weight(), in_proj_b.dense_weight()) {
-            (Some(wa), Some(wb)) => Tensor::cat(&[wa, wb], 0).ok(),
+            (Some(wa), Some(wb)) => Tensor::cat(&[wa, wb], 0)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .ok(),
             _ => None,
         };
 
@@ -616,30 +618,37 @@ impl LinearAttn {
         let device = x.device().clone();
         let dtype = x.dtype();
 
+        // Promote the hidden state to F32 once so the whole GatedDeltaNet path
+        // stays F32: QLinear::forward skips the output cast-back when input is
+        // already F32, so projections return F32 naturally.
+        let x_f32 = x.to_dtype(DType::F32)?;
+
         // ── Projections ───────────────────────────────────────────────────────
-        let qkv = self.in_proj_qkv.forward(x)?; // [b, t, key_dim*2 + value_dim]
-        let z = self.in_proj_z.forward(x)?; // [b, t, value_dim]
-                                            // P2: fuse in_proj_a + in_proj_b into a single dispatch.
-                                            // Priority order:
-                                            //   1. Dense path — both weights non-quantized: one broadcast_matmul (all devices).
-                                            //   2. Q4K path   — both weights Q4K on Metal, t==1: fwd_mv2_q4k (GGUF decode).
-                                            //   3. Fallback   — two separate forwards.
+        let qkv = self.in_proj_qkv.forward(&x_f32)?; // [b, t, key_dim*2 + value_dim]
+        let z = self.in_proj_z.forward(&x_f32)?; // [b, t, value_dim]
+                                                 // P2: fuse in_proj_a + in_proj_b into a single dispatch.
+                                                 // Priority order:
+                                                 //   1. Dense path — both weights non-quantized: one broadcast_matmul (all devices).
+                                                 //   2. Q4K path   — both weights Q4K on Metal, t==1: fwd_mv2_q4k (GGUF decode).
+                                                 //   3. Fallback   — two separate forwards.
         let (a_input, b_input) = 'proj: {
             if let Some(ref ab_w) = self.in_proj_ab_weight {
-                let ab = x.broadcast_matmul(&ab_w.t()?)?;
+                let ab = x_f32.broadcast_matmul(&ab_w.t()?)?;
                 let a = ab.narrow(2, 0, self.n_value_heads)?;
                 let b = ab.narrow(2, self.n_value_heads, self.n_value_heads)?;
                 break 'proj (a.contiguous()?, b.contiguous()?);
             }
             #[cfg(feature = "metal")]
             if t == 1 {
-                let xs_f32 = x.to_dtype(DType::F32)?;
-                if let Some(result) = self.in_proj_a.forward_paired_q4k(&self.in_proj_b, &xs_f32) {
+                if let Some(result) = self.in_proj_a.forward_paired_q4k(&self.in_proj_b, &x_f32) {
                     let (a_f32, b_f32) = result?;
                     break 'proj (a_f32, b_f32);
                 }
             }
-            (self.in_proj_a.forward(x)?, self.in_proj_b.forward(x)?)
+            (
+                self.in_proj_a.forward(&x_f32)?,
+                self.in_proj_b.forward(&x_f32)?,
+            )
         };
 
         // ── Depthwise causal conv1d on qkv, then SiLU ────────────────────────
@@ -683,14 +692,8 @@ impl LinearAttn {
         // After repeat: q, k, v all have n_value_heads as dim 2.
 
         // ── beta = sigmoid(b_input) ───────────────────────────────────────────
-        let b_f32 = b_input.to_dtype(DType::F32)?; // [b, t, n_value_heads]
-                                                   // sigmoid(x) = 1 / (1 + exp(-x))
-        let beta = candle_nn::ops::sigmoid(&b_f32)?;
-
-        // ── Cast q, k, v to F32 for the recurrence ────────────────────────────
-        let q_f32 = q.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_k_dim]
-        let k_f32 = k.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_k_dim]
-        let v_f32 = v.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_v_dim]
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        let beta = candle_nn::ops::sigmoid(&b_input)?;
 
         // ── Initialise recurrent state ────────────────────────────────────────
         // state: [b, n_value_heads, head_k_dim, head_v_dim]  F32
@@ -723,21 +726,28 @@ impl LinearAttn {
             };
             let g_t = g.narrow(1, 0, 1)?.squeeze(1)?;
             let beta_t = beta.narrow(1, 0, 1)?.squeeze(1)?;
-            let q_t = q_f32.narrow(1, 0, 1)?.squeeze(1)?;
-            let k_t = k_f32.narrow(1, 0, 1)?.squeeze(1)?;
-            let v_t = v_f32.narrow(1, 0, 1)?.squeeze(1)?;
+            let q_t = q.narrow(1, 0, 1)?.squeeze(1)?;
+            let k_t = k.narrow(1, 0, 1)?.squeeze(1)?;
+            let v_t = v.narrow(1, 0, 1)?.squeeze(1)?;
             let out = sequential_step(&q_t, &k_t, &v_t, &g_t, &beta_t, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out.unsqueeze(1)? // [b, 1, n_h, hv]
         } else {
             // Prefill path: chunked WY parallel scan.
             // Metal: fused kernel → g, then log(g) — 2 dispatches instead of 13.
-            //   g = exp(-a_exp * sp) ∈ (0, 1] so log is safe without FTZ risk.
-            // CPU/CUDA: compute log_g directly as -(a_exp * sp), avoiding the
-            //   exp+log round-trip that would give -inf under CUDA FTZ subnormals.
-            let log_g = if let Some(g) =
+            //   g = exp(-a_exp * sp) ∈ (0, 1] so log is safe (Metal keeps
+            //   subnormals; no FTZ).
+            // CPU/CUDA: compute log_g directly as -(a_exp * sp). On CUDA the
+            //   exp→log round-trip is unsafe because FTZ flushes subnormals
+            //   produced by exp(large_negative) to 0, and log(0) = -inf
+            //   propagates as NaN through the chunked WY scan.
+            let use_fused_gate = matches!(a_input.device(), Device::Metal(_));
+            let fused_g = if use_fused_gate {
                 candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
-            {
+            } else {
+                None
+            };
+            let log_g = if let Some(g) = fused_g {
                 g?.log()? // [b, t, n_value_heads] F32
             } else {
                 let a_f32 = a_input.to_dtype(DType::F32)?;
@@ -746,7 +756,7 @@ impl LinearAttn {
                 let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
                 a_exp_bc.broadcast_mul(&sp)?.neg()? // log_g = -(a_exp * sp), finite
             };
-            let out = gated_delta_rule_chunked(&q_f32, &k_f32, &v_f32, &log_g, &beta, &mut state)?;
+            let out = gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out // already [b, t, n_h, hv]
         };
@@ -761,9 +771,7 @@ impl LinearAttn {
         let out_normed = candle_nn::ops::rms_norm(&out_flat, &self.norm_weight, 1e-6)?;
 
         // z gate: [b, t, value_dim] -> [b*t*n_value_heads, head_v_dim], then silu
-        // z is in model dtype; cast to F32 for the gate multiply
-        let z_f32 = z.to_dtype(DType::F32)?;
-        let z_flat = z_f32
+        let z_flat = z
             .contiguous()?
             .reshape((b * t * self.n_value_heads, self.head_v_dim))?;
         let z_gate = z_flat.silu()?; // F32
@@ -783,13 +791,12 @@ impl LinearAttn {
     /// Mirrors the PyTorch reference:
     ///   `F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])`
     ///
-    /// x: [b, t, channels]
+    /// x: [b, t, channels]  — must be F32
     /// weight stored as [channels, 1, kernel] (depthwise)
-    /// Returns: [b, t, channels]  (after SiLU)
+    /// Returns: [b, t, channels]  F32 (after SiLU)
     fn apply_conv1d_silu(&mut self, x: &Tensor) -> Result<Tensor> {
         let (b, _t, c) = x.dims3()?;
         let kernel = self.conv1d_weight.dim(2)?;
-        let dtype = x.dtype();
         let device = x.device().clone();
 
         let pad_len = kernel - 1;
@@ -797,7 +804,7 @@ impl LinearAttn {
         // Build padded input [b, pad_len+t, c] using stored conv state or zeros
         let padded = match &self.conv_state {
             None => {
-                let zeros = Tensor::zeros((b, pad_len, c), dtype, &device)?;
+                let zeros = Tensor::zeros((b, pad_len, c), DType::F32, &device)?;
                 Tensor::cat(&[&zeros, x], 1)?
             }
             Some(prev) => Tensor::cat(&[prev, x], 1)?,
@@ -809,13 +816,12 @@ impl LinearAttn {
 
         // Use candle's native conv1d (Metal-accelerated depthwise: groups = c).
         // conv1d_weight is pre-computed in F32 at construction time.
-        let inp = padded.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+        let inp = padded.transpose(1, 2)?.contiguous()?;
         let out = inp.conv1d(&self.conv1d_weight, 0, 1, 1, c)?; // [b, c, t]
 
-        // Transpose back: [b, c, t] -> [b, t, c], restore original dtype, then SiLU
+        // Transpose back: [b, c, t] -> [b, t, c], then SiLU (stays F32)
         out.transpose(1, 2)?
             .contiguous()?
-            .to_dtype(dtype)?
             .silu()
             .map_err(Into::into)
     }
