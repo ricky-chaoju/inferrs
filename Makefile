@@ -18,11 +18,18 @@ else
 endif
 
 # inferrs-backend-cuda is only built on Linux or Windows x86_64 (not macOS,
-# not Windows ARM64).
+# not Windows ARM64).  When it is included, the `cuda` feature of the main
+# binary / multimodal / kernels crates is also enabled so the direct-linked
+# CUDA execution path compiles alongside the plugin.  Hosts without a CUDA
+# toolkit should build without these make targets (e.g. call `cargo build`
+# directly with an explicit `-p ...` list and no `--features cuda`) to get
+# a CPU-only binary that still probes the runtime backends via dlopen.
 ifeq ($(UNAME_S),Darwin)
   CUDA_PKG :=
+  CUDA_FEATURES :=
 else
   CUDA_PKG := -p inferrs-backend-cuda
+  CUDA_FEATURES := --features inferrs/cuda --features inferrs-multimodal/cuda --features inferrs-kernels/cuda
 endif
 
 # inferrs-backend-metal is only built on macOS (standard Apple SDK, no exotic
@@ -52,17 +59,17 @@ ui:
 	cargo build -p inferrs
 
 build: oci-lib
-	cargo build $(NO_GPU_PKGS)
+	cargo build $(NO_GPU_PKGS) $(CUDA_FEATURES)
 
 release: oci-lib-release
-	cargo build --release $(NO_GPU_PKGS)
+	cargo build --release $(NO_GPU_PKGS) $(CUDA_FEATURES)
 
 lint:
 	cargo fmt --check $(NO_GPU_PKGS)
-	cargo clippy $(NO_GPU_PKGS) -- -D warnings
+	cargo clippy $(NO_GPU_PKGS) $(CUDA_FEATURES) -- -D warnings
 
 test:
-	cargo test $(NO_GPU_PKGS)
+	cargo test $(NO_GPU_PKGS) $(CUDA_FEATURES)
 
 # Go C shared library for OCI model operations (called via FFI from Rust).
 oci-lib:
