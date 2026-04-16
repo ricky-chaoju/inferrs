@@ -12,6 +12,7 @@ pub enum Id {
     Fill,
     FlashAttn,
     Indexing,
+    LinearAttn,
     Quantized,
     Reduce,
     Sort,
@@ -19,7 +20,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 12] = [
+pub const ALL_IDS: [Id; 13] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -27,6 +28,7 @@ pub const ALL_IDS: [Id; 12] = [
     Id::Fill,
     Id::FlashAttn,
     Id::Indexing,
+    Id::LinearAttn,
     Id::Quantized,
     Id::Reduce,
     Id::Sort,
@@ -76,6 +78,7 @@ mdl!(CONV, Conv);
 mdl!(FILL, Fill);
 mdl!(FLASH_ATTN, FlashAttn);
 mdl!(INDEXING, Indexing);
+mdl!(LINEAR_ATTN, LinearAttn);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);
