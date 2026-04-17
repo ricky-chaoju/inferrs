@@ -35,21 +35,25 @@ fn version_flag_long() {
     );
 }
 
-/// `inferrs -V` is the short alias and must behave identically.
+/// `inferrs -v` is the short alias and must behave identically.
 #[test]
 fn version_flag_short() {
-    let (code, stdout, _) = inferrs(&["-V"]);
-    assert_eq!(code, 0, "-V should exit 0");
+    let (code, stdout, _) = inferrs(&["-v"]);
+    assert_eq!(code, 0, "-v should exit 0");
     assert!(
         stdout.starts_with("inferrs "),
-        "-V output should start with 'inferrs ', got: {stdout:?}"
+        "-v output should start with 'inferrs ', got: {stdout:?}"
+    );
+    assert!(
+        stdout.trim_end().chars().any(|c| c.is_ascii_digit()),
+        "-v output should contain a version number, got: {stdout:?}"
     );
 }
 
-/// `--version` and `-V` must print the same string.
+/// `--version` and `-v` must print the same string.
 #[test]
 fn version_flags_match() {
     let (_, long, _) = inferrs(&["--version"]);
-    let (_, short, _) = inferrs(&["-V"]);
-    assert_eq!(long, short, "--version and -V must print identical output");
+    let (_, short, _) = inferrs(&["-v"]);
+    assert_eq!(long, short, "--version and -v must print identical output");
 }
