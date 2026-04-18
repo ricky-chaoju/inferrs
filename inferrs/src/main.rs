@@ -52,8 +52,16 @@ impl std::fmt::Display for TurboQuantArg {
 }
 
 #[derive(Parser)]
-#[command(name = "inferrs", about = "A TurboQuant inference server")]
+#[command(
+    name = "inferrs",
+    about = "A TurboQuant inference server",
+    version = env!("CARGO_PKG_VERSION"),
+    disable_version_flag = true
+)]
 struct Cli {
+    /// Print version
+    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
     #[command(subcommand)]
     command: Commands,
 }
