@@ -275,9 +275,7 @@ pub fn oci_list_models() -> Result<Vec<(String, String)>> {
     let entries = raw
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, '\t');
-            let tag = parts.next()?;
-            let id = parts.next()?;
+            let (tag, id) = line.split_once('\t')?;
             Some((tag.to_string(), id.to_string()))
         })
         .collect();
@@ -608,6 +606,10 @@ async fn oci_pull_via_server(model: &str, base_url: &str) -> Result<()> {
     }
 
     // Drain the NDJSON stream and render multi-line progress.
+    // Only use ANSI escape codes when stderr is an interactive terminal;
+    // fall back to plain line-based output otherwise (e.g. log files).
+    use std::io::IsTerminal;
+    let is_tty = std::io::stderr().is_terminal();
     let mut out = std::io::stderr();
     let mut byte_stream = response.bytes_stream();
     let mut line_buf = String::new();
@@ -645,30 +647,38 @@ async fn oci_pull_via_server(model: &str, base_url: &str) -> Result<()> {
                 (&status.digest, status.total, status.completed)
             {
                 if total > 0 && !digest.is_empty() {
-                    let line_idx = progress.line_for_digest(digest, &mut out)?;
+                    if is_tty {
+                        let line_idx = progress.line_for_digest(digest, &mut out)?;
 
-                    let pct = (completed as f64 / total as f64 * 100.0).min(100.0);
-                    let bar_width = 20;
-                    let filled = (pct / 100.0 * bar_width as f64) as usize;
-                    let empty = bar_width - filled;
+                        let pct = (completed as f64 / total as f64 * 100.0).min(100.0);
+                        let bar_width = 20;
+                        let filled = (pct / 100.0 * bar_width as f64) as usize;
+                        let empty = bar_width - filled;
 
-                    let short = short_digest(digest);
-                    let bar = format!(
-                        "pulling {short}  {pct:5.1}% ▕{}{}▏ {}/{}",
-                        "█".repeat(filled),
-                        "░".repeat(empty),
-                        human_bytes(completed),
-                        human_bytes(total),
-                    );
-                    progress.update_line(line_idx, &bar, &mut out)?;
+                        let short = short_digest(digest);
+                        let bar = format!(
+                            "pulling {short}  {pct:5.1}% ▕{}{}▏ {}/{}",
+                            "█".repeat(filled),
+                            "░".repeat(empty),
+                            human_bytes(completed),
+                            human_bytes(total),
+                        );
+                        progress.update_line(line_idx, &bar, &mut out)?;
+                    }
+                    // Non-TTY: skip per-chunk progress to avoid flooding logs;
+                    // status-only lines below still print completion milestones.
                     continue;
                 }
             }
 
             // Status-only line (no progress bar) — print at the bottom.
             if let Some(ref msg) = status.status {
-                writeln!(out, "\r\x1b[2K{msg}")?;
-                progress.total_lines += 1;
+                if is_tty {
+                    writeln!(out, "\r\x1b[2K{msg}")?;
+                    progress.total_lines += 1;
+                } else {
+                    writeln!(out, "{msg}")?;
+                }
                 out.flush()?;
             }
         }
