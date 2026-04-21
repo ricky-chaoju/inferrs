@@ -438,7 +438,6 @@ struct PullStatus {
     status: Option<String>,
     #[serde(default)]
     digest: Option<String>,
-    #[serde(default)]
     total: Option<u64>,
     #[serde(default)]
     completed: Option<u64>,
@@ -464,8 +463,64 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// State for multi-line progress rendering (one line per layer digest).
+struct PullProgress {
+    /// Ordered list of digest strings we've seen so far.
+    digests: Vec<String>,
+    /// Current total number of output lines (status + progress lines).
+    total_lines: usize,
+}
+
+impl PullProgress {
+    fn new() -> Self {
+        Self {
+            digests: Vec::new(),
+            total_lines: 0,
+        }
+    }
+
+    /// Return the line index (0-based from top) for a digest, adding a new
+    /// line if this digest hasn't been seen before.
+    fn line_for_digest(&mut self, digest: &str, out: &mut impl Write) -> std::io::Result<usize> {
+        if let Some(pos) = self.digests.iter().position(|d| d == digest) {
+            return Ok(pos);
+        }
+        // New digest — allocate a new line at the bottom.
+        let idx = self.digests.len();
+        self.digests.push(digest.to_string());
+        // Print a blank line for this new entry.
+        writeln!(out)?;
+        self.total_lines += 1;
+        Ok(idx)
+    }
+
+    /// Move the cursor to a specific progress line, update it, then move back
+    /// to the bottom.
+    fn update_line(
+        &self,
+        line_idx: usize,
+        content: &str,
+        out: &mut impl Write,
+    ) -> std::io::Result<()> {
+        let bottom = self.total_lines - 1;
+        let lines_up = bottom - line_idx;
+
+        if lines_up > 0 {
+            // Move cursor up N lines.
+            write!(out, "\x1b[{lines_up}A")?;
+        }
+        // Overwrite the line.
+        write!(out, "\r\x1b[2K{content}")?;
+        if lines_up > 0 {
+            // Move cursor back down.
+            write!(out, "\x1b[{lines_up}B")?;
+        }
+        out.flush()
+    }
+}
+
 /// Pull an OCI model via the server's `/api/pull` endpoint with streaming
-/// progress, rendering Ollama-style output to the terminal.
+/// progress, rendering Ollama-style multi-line output to the terminal.
 async fn oci_pull_via_server(model: &str, base_url: &str) -> Result<()> {
     use futures::StreamExt;
 
@@ -491,11 +546,11 @@ async fn oci_pull_via_server(model: &str, base_url: &str) -> Result<()> {
         anyhow::bail!("Server returned {status}: {text}");
     }
 
-    // Drain the NDJSON stream and render progress.
-    let mut stdout = std::io::stderr();
+    // Drain the NDJSON stream and render multi-line progress.
+    let mut out = std::io::stderr();
     let mut byte_stream = response.bytes_stream();
     let mut line_buf = String::new();
-    let mut last_was_progress = false;
+    let mut progress = PullProgress::new();
 
     while let Some(chunk) = byte_stream.next().await {
         let chunk = chunk.context("Error reading pull response stream")?;
@@ -518,53 +573,60 @@ async fn oci_pull_via_server(model: &str, base_url: &str) -> Result<()> {
                 }
             };
 
-            // Check for errors
+            // Check for errors.
             if let Some(ref err) = status.error {
-                if last_was_progress {
-                    eprintln!(); // newline after progress bar
-                }
+                writeln!(out)?;
                 anyhow::bail!("Pull failed: {err}");
             }
 
-            // Render progress
-            if let (Some(ref msg), Some(total), Some(completed)) =
-                (&status.status, status.total, status.completed)
+            // Progress update for a specific layer (has digest + total > 0).
+            if let (Some(ref digest), Some(total), Some(completed)) =
+                (&status.digest, status.total, status.completed)
             {
-                if total > 0 {
+                if total > 0 && !digest.is_empty() {
+                    let line_idx = progress.line_for_digest(digest, &mut out)?;
+
                     let pct = (completed as f64 / total as f64 * 100.0).min(100.0);
-                    let bar_width = 30;
+                    let bar_width = 20;
                     let filled = (pct / 100.0 * bar_width as f64) as usize;
                     let empty = bar_width - filled;
-                    write!(
-                        stdout,
-                        "\r{msg}  {pct:5.1}% [{}>{}] {}/{}  ",
+
+                    let short = short_digest(digest);
+                    let bar = format!(
+                        "pulling {short}  {pct:5.1}% ▕{}{}▏ {}/{}",
                         "█".repeat(filled),
                         "░".repeat(empty),
                         human_bytes(completed),
                         human_bytes(total),
-                    )?;
-                    stdout.flush()?;
-                    last_was_progress = true;
+                    );
+                    progress.update_line(line_idx, &bar, &mut out)?;
                     continue;
                 }
             }
 
-            // Status-only line (no progress bar)
+            // Status-only line (no progress bar) — print at the bottom.
             if let Some(ref msg) = status.status {
-                if last_was_progress {
-                    eprintln!(); // newline after progress bar
-                    last_was_progress = false;
-                }
-                eprintln!("{msg}");
+                writeln!(out, "\r\x1b[2K{msg}")?;
+                progress.total_lines += 1;
+                out.flush()?;
             }
         }
     }
 
-    if last_was_progress {
-        eprintln!(); // final newline after progress bar
-    }
-
     Ok(())
+}
+
+/// Shorten a digest for display (e.g. "sha256:abcdef123456..." → "abcdef123456").
+fn short_digest(digest: &str) -> &str {
+    const PREFIX: &str = "sha256:";
+    const SHORT_LEN: usize = 12;
+
+    let s = digest.strip_prefix(PREFIX).unwrap_or(digest);
+    if s.len() > SHORT_LEN {
+        &s[..SHORT_LEN]
+    } else {
+        s
+    }
 }
 
 // ---------------------------------------------------------------------------
