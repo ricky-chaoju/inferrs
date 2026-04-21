@@ -1262,8 +1262,8 @@ fn spawn_active_pull(
     key: String,
     reference: String,
 ) -> Result<Arc<ActivePull>, String> {
-    let mut stream_handle = crate::pull::oci_pull_stream_start(&reference)
-        .map_err(|e| e.to_string())?;
+    let mut stream_handle =
+        crate::pull::oci_pull_stream_start(&reference).map_err(|e| e.to_string())?;
 
     let (tx, _) = broadcast::channel(256);
     let (done_tx, done_rx) = watch::channel(None);

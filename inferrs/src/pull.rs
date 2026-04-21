@@ -70,7 +70,6 @@ const LIB_NAME: &str = "ocimodels.dll";
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const LIB_NAME: &str = "libocimodels.so";
 
-
 /// Try to load the OCI shared library, returning a reference to the resolved
 /// function pointers.  The library is loaded at most once; subsequent calls
 /// return the cached result.
